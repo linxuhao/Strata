@@ -879,6 +879,7 @@ bool gdn_keyhead_ok() {
 // than they save below ~100 tokens (gdn_rec_parity --bench: 32 tokens 0.58x gdn_rec_kh_kernel, 96 1.03x, 128 1.20x,
 // 512 1.67x, 2048+ 1.81x)
 constexpr int64_t kGdnChunkedMin = 128;
+constexpr int64_t kGdnTcMin = 128;        // STRATA_GDN_TC: the two launches cost ~20 us; below this the kh kernel wins
 constexpr int GCH = 32;            // tokens per chunk (the prep's solve is a lane per token)
 constexpr int GSB = 2048;          // tokens per super-block: the prep's scratch is GSB / GCH chunks of T, P and gamma
 constexpr int GDV = 16;            // value columns per scan block
@@ -2778,7 +2779,12 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
         // STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens (other
         // bits; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below)
         static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
-        if (chunked && T >= kGdnChunkedMin && gdn_rec_chunked(state, h, gate, beta, y, T, (cudaStream_t) stream) == cudaSuccess) {
+        // STRATA_GDN_TC=1 (opt-in): the chunked recurrence with the scan on the tensor cores (gdn_tc.cuh) for prompt
+        // chunks of kGdnTcMin+ tokens: within 1e-4 of the kernels below (gdn_rec_parity), 2.85x gdn_rec_kh_kernel on a
+        // CMP 170HX; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below
+        static const bool tc = [] { const char* v = std::getenv("STRATA_GDN_TC"); return v != nullptr && std::atoi(v) != 0; }();
+        if (tc && T >= kGdnTcMin && gdn_rec_tc(state, h, gate, beta, y, T, (cudaStream_t) stream) == cudaSuccess) {
+        } else if (chunked && T >= kGdnChunkedMin && gdn_rec_chunked(state, h, gate, beta, y, T, (cudaStream_t) stream) == cudaSuccess) {
         } else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
             gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else

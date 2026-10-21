@@ -326,26 +326,30 @@ __device__ __forceinline__ void gtc_update_state(float (&s)[16][4], const float 
     }
 }
 
-// ---- the prep: gdn_chunk_prep_kernel (kernels.cu) for the tensor-core scan - the same Gram products, A, solve and T
-// (the same bits), but it writes what the scan stages by cp.async with no conversion of its own: k and q as f16 hi /
-// lo images x 2^8 straight from the float4 registers the rows arrive in (rows past the chunk's end zero), P as f16
-// hi / lo images x 2^8 (the split the scan did, element by element) and the token scalars (beta, exp(gamma),
-// exp(gL - gamma), gamma) as a float4 a token; T stays f32 (split to tf32 at use).  A block per (chunk, key head).
+// ---- the prep: gdn_chunk_prep_kernel (kernels.cu) for the tensor-core scan, a block per (chunk, key head): the same
+// A, solve, T and P, but the Gram products k_t.k_i and q_t.k_i on the tensor cores (f16x3 from the k and q hi / lo
+// images x 2^8, which the block builds first in shared memory straight from the float4 registers the rows arrive in,
+// rows past the chunk's end zero: 48 mma a warp against ~1,150 LDS a thread for the FFMA form, which was LDS-bound at
+// 233 us a 2048-token super-block), and it writes what the scan stages by cp.async with no conversion of its own: the
+// same k / q images, P as f16 hi / lo images x 2^8 (the split the scan did, element by element) and the token scalars
+// (beta, exp(gamma), exp(gL - gamma), gamma) as a float4 a token; T stays f32 (split to tf32 at use).  The Gram
+// entries are within 3 x 2^-22 of exact (the scan's bound), so T and P differ from gdn_chunk_prep_kernel's by that.
+constexpr size_t kTcPrepSmem = (size_t) 4 * GCH * GTC_KP * 2 + 2 * GCH * GTP * 4;   // the images, then k_t.k_i and q_t.k_i
+static_assert(VPK * GCH * GTP * 4 <= 4 * GCH * GTC_KP * 2, "gdn_tc_prep_kernel: A fits where the images were");
 __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restrict__ h, const float* __restrict__ gate,
                                                           const float* __restrict__ beta, float* __restrict__ tm,
                                                           float4* __restrict__ sc, uint16_t* __restrict__ kq,
                                                           uint16_t* __restrict__ pi, int64_t t0, int64_t T) {
     extern __shared__ __align__(16) float gsm[];
-    float* sk = gsm;                       // [GCH][S + 1]
-    float* sq = sk + GCH * (S + 1);        // [GCH][S + 1]
-    float* skk = sq + GCH * (S + 1);       // [GCH][GTP]  k_t.k_i
-    float* sqk = skk + GCH * GTP;          // [GCH][GTP]  q_t.k_i
-    float* sa = gsm;                       // [VPK][GCH][GTP]  A, then T below the diagonal (over k and q:
-                                           // read by then, so two blocks share an SM)
+    uint16_t* im = reinterpret_cast<uint16_t*>(gsm);   // [4][GCH][GTC_KP]  k hi, k lo, q hi, q lo (x 2^8)
+    float* skk = gsm + 4 * GCH * GTC_KP / 2;           // [GCH][GTP]  k_t.k_i
+    float* sqk = skk + GCH * GTP;                      // [GCH][GTP]  q_t.k_i
+    float* sa = gsm;                                   // [VPK][GCH][GTP]  A, then T below the diagonal (over the
+                                                       // images: read by then)
     const int qh = blockIdx.y, ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int64_t tb = t0 + (int64_t) ch * GCH;
     const int n = (int) min((int64_t) GCH, T - tb);
-    {   // k and q as float4, every load issued before the first store; the images from the same registers
+    {   // k and q as float4, every load issued before the first store; the images to shared and to global
         constexpr int NP = GCH * S / 4 / 256;   // float4 a thread, each of k and q
         float4 kv[NP], qv[NP];
 #pragma unroll
@@ -354,40 +358,44 @@ __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restric
             kv[m] = t < n ? *reinterpret_cast<const float4*>(h + (tb + t) * C + HK * S + qh * S + r) : make_float4(0.f, 0.f, 0.f, 0.f);
             qv[m] = t < n ? *reinterpret_cast<const float4*>(h + (tb + t) * C + qh * S + r) : make_float4(0.f, 0.f, 0.f, 0.f);
         }
-#pragma unroll
-        for (int m = 0; m < NP; ++m) {
-            const int p = tid + 256 * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
-            float* dk = sk + t * (S + 1) + r;
-            float* dq = sq + t * (S + 1) + r;
-            dk[0] = kv[m].x; dk[1] = kv[m].y; dk[2] = kv[m].z; dk[3] = kv[m].w;
-            dq[0] = qv[m].x; dq[1] = qv[m].y; dq[2] = qv[m].z; dq[3] = qv[m].w;
-        }
         uint16_t* img = kq + ((size_t) ch * HK + qh) * 4 * GCH * S;
 #pragma unroll
         for (int m = 0; m < NP; ++m) {
             const int p = tid + 256 * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
+            const int o = t * GTC_KP + r;
+            gtc_split_store4(im + o, im + GCH * GTC_KP + o, kv[m], 256.0f);
+            gtc_split_store4(im + 2 * GCH * GTC_KP + o, im + 3 * GCH * GTC_KP + o, qv[m], 256.0f);
             gtc_split_store4(img + t * S + r, img + GCH * S + t * S + r, kv[m], 256.0f);
             gtc_split_store4(img + 2 * GCH * S + t * S + r, img + 3 * GCH * S + t * S + r, qv[m], 256.0f);
         }
     }
     __syncthreads();
-    {   // lane i, rows warp + 8m: k_t.k_i and q_t.k_i on eight independent sums (rows 129 apart: 32 banks)
-        constexpr int RW = GCH / 8;
-        float kk[RW] = {}, qk[RW] = {};
-        for (int r = 0; r < S; ++r) {
-            const float ki = sk[lane * (S + 1) + r];
+    {   // the Gram products: warp w takes product w >> 2 (k_t.k_i, q_t.k_i), rows 16 ((w >> 1) & 1).. (the A
+        // tile, by ldmatrix as a row-major [t][r] 16 x 16), columns 16 (w & 1).. (two n-tiles: B = k^T, stored
+        // [n][k] = the k rows, by ldmatrix as the scan's gtc_prod_state); the accumulators come out x 2^16
+        const int pr = warp >> 2, mt = (warp >> 1) & 1, np = warp & 1;
+        const uint16_t* ah_ = im + 2 * pr * GCH * GTC_KP + (16 * mt + (lane & 7) + 8 * ((lane >> 3) & 1)) * GTC_KP + 8 * (lane >> 4);
+        const uint16_t* bh_ = im + (16 * np + 8 * (lane >> 4) + (lane & 7)) * GTC_KP + 8 * ((lane >> 3) & 1);
+        float c[2][4] = {};
 #pragma unroll
-            for (int m = 0; m < RW; ++m) {
-                kk[m] = fmaf(sk[(warp + 8 * m) * (S + 1) + r], ki, kk[m]);
-                qk[m] = fmaf(sq[(warp + 8 * m) * (S + 1) + r], ki, qk[m]);
+        for (int kk = 0; kk < S / 16; ++kk) {
+            uint32_t ah[4], al[4], bh[4], bl[4];
+            gtc_ldsm_x4(ah, ah_ + 16 * kk);
+            gtc_ldsm_x4(al, ah_ + GCH * GTC_KP + 16 * kk);
+            gtc_ldsm_x4(bh, bh_ + 16 * kk);
+            gtc_ldsm_x4(bl, bh_ + GCH * GTC_KP + 16 * kk);
+            gtc_mma3_f16(c[0], ah, al, bh[0], bh[1], bl[0], bl[1]);
+            gtc_mma3_f16(c[1], ah, al, bh[2], bh[3], bl[2], bl[3]);
+        }
+        float* g = pr ? sqk : skk;
+        const int gid = lane >> 2, tig = lane & 3;
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int t = 16 * mt + gid + 8 * (q >> 1), i = 16 * np + 8 * j + 2 * tig + (q & 1);
+                g[t * GTP + i] = i <= t ? c[j][q] * gtc_pow2(-16) : 0.0f;
             }
-        }
-#pragma unroll
-        for (int m = 0; m < RW; ++m) {
-            const int t = warp + 8 * m;
-            skk[t * GTP + lane] = lane <= t ? kk[m] : 0.0f;
-            sqk[t * GTP + lane] = lane <= t ? qk[m] : 0.0f;
-        }
     }
     __syncthreads();
     if (warp >= VPK) return;

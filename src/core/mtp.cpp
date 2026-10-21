@@ -438,8 +438,11 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     bool prio = false;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (HIP, Metal: the default priority)
     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
+    // STRATA_MTP_PRIO_ALWAYS=1 (plan-decode step 2, B): the highest priority without the forcing graphs too, so the
+    // draft round's first kernels are dispatched ahead of the commit graph's queued blocks (unset: only with --pipeline-windows)
+    static const bool prio_always = [] { const char* v = std::getenv("STRATA_MTP_PRIO_ALWAYS"); return v != nullptr && std::atoi(v) != 0; }();
     int prio_lo = 0, prio_hi = 0;
-    if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+    if ((force_on_ || prio_always) && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
     cudaGetLastError();
 #endif

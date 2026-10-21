@@ -522,12 +522,14 @@ gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const
         const float* bsv = sv + b * GCH * GTC_VP;
         const float* bst = st + b * GCH * GTC_TP;
         const float4* bsc = sc + b * GCH;
-        // (a) X^T = S0^T K^T and QS^T = S0^T Q^T, the state x 2^es (its largest entry in [2^14, 2^15))
-        float m = 0.0f;
+        // (a) X^T = S0^T K^T and QS^T = S0^T Q^T, the state x 2^es (its largest entry in [2^14, 2^15)).  The lane's
+        // maximum over eight chains (nvcc keeps the order written: one chain was 64 dependent FMNMX before the first mma)
+        float m8[8] = {};
 #pragma unroll
         for (int j = 0; j < 16; ++j)
 #pragma unroll
-            for (int q = 0; q < 4; ++q) m = fmaxf(m, fabsf(s[j][q]));
+            for (int q = 0; q < 4; ++q) m8[(2 * j + (q >> 1)) & 7] = fmaxf(m8[(2 * j + (q >> 1)) & 7], fabsf(s[j][q]));
+        const float m = fmaxf(fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])), fmaxf(fmaxf(m8[4], m8[5]), fmaxf(m8[6], m8[7])));
         const int es = gtc_scale_exp(gtc_warp_max(m));
         float xt[4][4] = {}, qs[4][4] = {};
         gtc_prod_state(s, gtc_pow2(es), bkh, bkl, bqh, bql, xt, qs);
@@ -550,12 +552,12 @@ gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const
         gtc_prod_yt<true>(yt, bst, dt);
         // (d) o^T = e_t QS^T + D^T P^T: the accumulator starts as 2^(ed + 8) e_t QS^T (QS^T came out x 2^(8 + es)),
         // D^T goes in x 2^ed, P x 2^8; the output is the accumulator x 2^-(ed + 8), then rsqrt(S) as gdn_chunk_scan_kernel
-        float md = 0.0f;
+        float md4[4] = {};
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt)
 #pragma unroll
-            for (int q = 0; q < 4; ++q) md = fmaxf(md, fabsf(dt[nt][q]));
-        const int ed = gtc_scale_exp(gtc_warp_max(md));
+            for (int q = 0; q < 4; ++q) md4[q] = fmaxf(md4[q], fabsf(dt[nt][q]));
+        const int ed = gtc_scale_exp(gtc_warp_max(fmaxf(fmaxf(md4[0], md4[1]), fmaxf(md4[2], md4[3]))));
         const float sD = gtc_pow2(ed), sO = gtc_pow2(ed + 8), sOi = gtc_pow2(-(ed + 8)), eO = gtc_pow2(ed - es);
         float ot[4][4];
 #pragma unroll

@@ -15,6 +15,8 @@
 //   gdn_rec_parity            the bit checks (T from 1 to 4099, a non-zero state as after an earlier chunk)
 //   gdn_rec_parity --long     and the tensor-core scan at T = 51820 (needs ~7 GB)
 //   gdn_rec_parity --selftest-frag   the tensor-core scan's fragment helpers alone, one warp each, against FP64
+//   gdn_rec_parity --bench-tc the tensor-core series alone (gdn_rec_kh_kernel and the scan alternating, nothing else:
+//                             for A / B runs of two builds back to back)
 //   gdn_rec_parity --bench    and the timings at T = 2048, 8192 and 32768 (one layer, all 48 value heads); the two
 //                             variants' launches alternate, since a card under load steps its clock down after a
 //                             fraction of a second (see native_grouped_parity); then both at 1 to 6 blocks per
@@ -610,25 +612,22 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
         }
         if (major < 8 || sms < HV || (size_t) smem < kTcScanSmem<false>) return cudaErrorNotSupported;
     }
-    float* scratch = gdn_chunk_scratch();
-    if (scratch == nullptr) return cudaErrorMemoryAllocation;
-    const int nb = (int) ((std::min<int64_t>(GSB, T) + GCH - 1) / GCH);
-    const size_t tsz = (size_t) nb * HV * GCH * GCH;
-    float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
+    const GtcScratch sc = gdn_tc_scratch();
+    if (sc.tm == nullptr) return cudaErrorMemoryAllocation;
     {   // once a device
         static bool attrs[64] = {};
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev >= 0 && dev < 64 && !attrs[dev]) {
-            cudaFuncSetAttribute(gdn_chunk_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kChunkPrepSmem);
+            cudaFuncSetAttribute(gdn_tc_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kChunkPrepSmem);
             cudaFuncSetAttribute(gdn_tc_scan_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
             attrs[dev] = true;
         }
     }
     for (int64_t t0 = 0; t0 < T; t0 += GSB) {
         const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
-        gdn_chunk_prep_kernel<<<dim3((unsigned) nch, HK), 256, kChunkPrepSmem, s>>>(h, gate, beta, tm, pm, gm, t0, T);
-        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, beta, tm, pm, gm, y, t0, nch, T);
+        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kChunkPrepSmem, s>>>(h, gate, beta, sc.tm, sc.sc, sc.kq, sc.pi, t0, T);
+        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, sc.tm, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
     }
     return cudaSuccess;
 }
@@ -1253,7 +1252,8 @@ float median(std::vector<float> v) {
     return v.empty() ? 0.0f : v[v.size() / 2];
 }
 
-void bench(int64_t T) {
+// tc_only (--bench-tc): the tensor-core series alone, for A / B runs of two builds back to back
+void bench(int64_t T, bool tc_only = false) {
     Inputs in(T, 0xB3);
     const size_t st = (size_t) S * HV * S, oc_n = (size_t) T * HV * S;
     float* state = dalloc<float>(st);
@@ -1274,14 +1274,14 @@ void bench(int64_t T) {
     };
     const int warm = 3, rounds = T >= 16384 ? 10 : 20;
     std::vector<float> t_rec[kRecCount], t_norm[2];
-    for (int i = 0; i < warm + rounds; ++i) {
+    for (int i = 0; !tc_only && i < warm + rounds; ++i) {
         for (int j = 0; j < kRecCount; ++j) {
             const Rec v = (Rec) ((i + j) % kRecCount);   // a different variant first in each round
             const float ms = timed([&] { run_rec(v, state, in, oc); });
             if (i >= warm) t_rec[v].push_back(ms);
         }
     }
-    for (int i = 0; i < warm + rounds; ++i) {
+    for (int i = 0; !tc_only && i < warm + rounds; ++i) {
         for (int j = 0; j < 2; ++j) {
             const int v = (i + j) % 2;
             const float ms = timed([&] {
@@ -1292,7 +1292,7 @@ void bench(int64_t T) {
         }
     }
     std::vector<float> t_kc[2];   // gdn_rec_kh_kernel and the chunked recurrence, alternating
-    const bool can_chunk = gdn_rec_chunked(state, in.h, in.gate, in.beta, oc, in.T, 0) == cudaSuccess &&
+    const bool can_chunk = !tc_only && gdn_rec_chunked(state, in.h, in.gate, in.beta, oc, in.T, 0) == cudaSuccess &&
                            cudaDeviceSynchronize() == cudaSuccess;
     for (int i = 0; can_chunk && i < warm + rounds; ++i)
         for (int j = 0; j < 2; ++j) {
@@ -1317,6 +1317,16 @@ void bench(int64_t T) {
         }
     const float r0 = median(t_rec[kBefore]), r1 = median(t_rec[kKeyHead]), n0 = median(t_norm[0]), n1 = median(t_norm[1]);
     std::printf("  T = %lld tokens, one layer (48 value heads), medians of %d alternating runs:\n", (long long) T, rounds);
+    if (tc_only) {
+        const float kh = median(t_tc[0]), tc = median(t_tc[1]);
+        std::printf("    recurrence, gdn_rec_kh_kernel                  %8.2f ms  (%.3f us per token)\n", kh, 1000.0f * kh / (float) T);
+        std::printf("    recurrence, tensor-core chunked (STRATA_GDN_TC=1) %8.2f ms  (%.3f us per token)  %.2fx gdn_rec_kh_kernel\n",
+                    tc, 1000.0f * tc / (float) T, kh / tc);
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        cudaFree(state); cudaFree(oc); cudaFree(y16);
+        return;
+    }
     std::printf("    recurrence, before (gdn_rec_cols_pipe_kernel)  %8.2f ms  (%.3f us per token)\n", r0,
                 1000.0f * r0 / (float) T);
     std::printf("    recurrence, gdn_rec_kh_kernel                  %8.2f ms  (%.3f us per token)  %.2fx\n", r1,
@@ -1728,11 +1738,12 @@ void fewer_sms(int64_t T) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool do_bench = false, do_self = false, do_long = false;
+    bool do_bench = false, do_self = false, do_long = false, do_bench_tc = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
         if (std::strcmp(argv[i], "--selftest-frag") == 0) do_self = true;
         if (std::strcmp(argv[i], "--long") == 0) do_long = true;
+        if (std::strcmp(argv[i], "--bench-tc") == 0) do_bench_tc = true;
     }
     cudaDeviceProp p{};
     ck(cudaGetDeviceProperties(&p, 0), "device");
@@ -1742,6 +1753,10 @@ int main(int argc, char** argv) {
         fails = selftest_frag();
         std::printf("gdn_rec_parity: %d failures\n", fails);
         return fails ? 1 : 0;
+    }
+    if (do_bench_tc) {   // the tensor-core timings alone
+        for (const int64_t T : {(int64_t) 2048, (int64_t) 8192, (int64_t) 32768}) bench(T, true);
+        return 0;
     }
     const int64_t Ts[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 257, 1000, 4099};
     uint64_t seed = 11;

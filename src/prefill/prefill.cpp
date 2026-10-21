@@ -3623,11 +3623,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t per = (size_t) std::max(1, m.ring / 3);
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
+                        // STRATA_PF_BATCH=N (opt-in, at most fused::kBatchRoom): experts per launch (the same rows, so the
+                        // same bits; a launch is one persistent grid, so fewer launches leave fewer grid tails)
+                        static const int pf_batch = [] {
+                            const char* v = std::getenv("STRATA_PF_BATCH");
+                            const int n = v ? std::atoi(v) : 0;
+                            return n > 0 ? std::min(n, fused::kBatchRoom) : fused::kMaxBatch;
+                        }();
                         for (int32_t e = 0; e < m.g->n_expert;) {
                             fused::Batch b;
                             b.e0 = e;
                             const size_t k0 = k;
-                            for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
+                            for (; e < m.g->n_expert && e - b.e0 < pf_batch; ++e) {
                                 if (k < kend && seq[k].e == e) {
                                     if (k - k0 == per) break;
                                     b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];

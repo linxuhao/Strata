@@ -237,9 +237,14 @@ bool park_async_on() {
 #endif
 }
 bool on_device(const void* p) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    (void) p;   // (no pointer-attribute query in the shims: the slot takes no part, as when the query fails)
+    return false;
+#else
     cudaPointerAttributes at{};
     if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return false; }
     return at.type == cudaMemoryTypeDevice;
+#endif
 }
 // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
 // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.

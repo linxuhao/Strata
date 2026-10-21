@@ -1863,11 +1863,14 @@ void launch(int ww, unsigned grid, const Batch& b, const NativeGeom& g, const Ta
             const int32_t* src, void* out, float* dm, cudaStream_t s) {
     const uint8_t* a = (const uint8_t*) act;
     uint8_t* o = (uint8_t*) out;
+#if !defined(__HIPCC__)   // (native_ws_kernel and the F16 path are CUDA only; d.ws is never set on HIP)
     if (ww == 512)
         native_ws_kernel<T, GU><<<grid, WS_THREADS, ws_smem_bytes(T), s>>>(b, g, tb, a, src, o, dm);
     else if (ww == 256 && f16c_requested())
         native_kernel<T, GU, 2, 256, true><<<grid, 256, smem_bytes(T, 2, host_astages(), 256, true), s>>>(b, g, tb, a, src, o, dm);
-    else if (ww == 256) native_kernel<T, GU, 2, 256><<<grid, 256, smem_bytes(T, 2, host_astages(), 256), s>>>(b, g, tb, a, src, o, dm);
+    else
+#endif
+    if (ww == 256) native_kernel<T, GU, 2, 256><<<grid, 256, smem_bytes(T, 2, host_astages(), 256), s>>>(b, g, tb, a, src, o, dm);
     else if (ww == 4) native_kernel<T, GU, 4><<<grid, THREADS, smem_bytes(T, 4, host_astages()), s>>>(b, g, tb, a, src, o, dm);
     else native_kernel<T, GU, 2><<<grid, THREADS, smem_bytes(T, 2, host_astages()), s>>>(b, g, tb, a, src, o, dm);
 }

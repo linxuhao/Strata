@@ -535,6 +535,7 @@ __global__ void __launch_bounds__(THREADS, 4) gr_up75_kernel(GrMulti m) {
 // the first batch's dots), and the token arguments are read from shared memory (m.a[lane] is a register-indexed
 // constant-bank read, IMC-miss stalls 1.2 cycles an instruction in ncu).  STRATA_GR_UP75W=1 takes it wherever
 // gr_up75_kernel runs (3+ tokens).
+#if !defined(__HIPCC__)   // CUDA only (up75_on() is false on HIP; hipcc refuses a __shared__ FusedGrArgs, which has default member initializers)
 constexpr int UPW_COLS = 8, UPW_BLOCKS = N / UPW_COLS;   // 320
 template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
 __global__ void __launch_bounds__(THREADS, 5) gr_up75w_kernel(GrMulti m) {
@@ -621,6 +622,7 @@ __global__ void __launch_bounds__(THREADS, 5) gr_up75w_kernel(GrMulti m) {
     }
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0, 32 / UPW_COLS);   // S26 STRATA_QFUSE: 4 blocks own a 32-column group
 }
+#endif   // !__HIPCC__
 
 
 // 143-amdk (STRATA_QFUSE_HC): gr_up_multi_kernel with 32 columns a block (512 threads, 80 blocks, the same 8 rows a warp), so a block owns a whole
@@ -1780,10 +1782,12 @@ bool qfuse_hc_local() {
 // Turing: gr_up75_kernel for 3+ tokens (bitwise gr_up_multi_kernel; fused_gr_bench cold on an RTX 2080 Ti, up incl. a
 // stamp: T 3 27.3 -> 24.6 us, T 4 33.2 -> 28.7, T 6 46.6 -> 36.6); STRATA_GR_UP75=0 / 1 forces it off / on
 // P5: gr_up75w_kernel in gr_up75_kernel's place (STRATA_GR_UP75W=1; unset / 0: gr_up75_kernel)
+#if !defined(__HIPCC__)
 bool up75w_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_GR_UP75W"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+#endif
 bool up75_on() {
 #if defined(__HIPCC__)
     return false;
@@ -1946,6 +1950,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             case 6: gr_up_multi_kernel<6, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
             default: gr_up_multi_kernel<kFusedGrMaxT, false, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
         }
+#if !defined(__HIPCC__)
     } else if (n_tok >= 3 && up75_on() && up75w_on()) {   // P5: gr_up75_kernel's rows at 512 threads, loads first
         switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
             case 1: gr_up75w_kernel<1, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
@@ -1956,6 +1961,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             case 6: gr_up75w_kernel<6, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
             default: gr_up75w_kernel<kFusedGrMaxT, false><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
         }
+#endif
     } else if (n_tok >= 3 && up75_on()) {   // T 1-2: gr_up_multi_kernel is as fast or faster (fused_gr_bench, cold)
         switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
             case 1: gr_up75_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;

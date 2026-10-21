@@ -667,6 +667,7 @@ __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restr
     return d * sumf;
 }
 
+#if !defined(__HIPCC__)   // CUDA only (PTX): used by the native_mmvq_il_pf_kernel family below, itself CUDA only
 // P1: loads the compiler may not sink into a later branch (it moved the Q6_K scale and d loads of the hoisted group
 // into the dot sections, where each one is a dependent L1 round trip); the same ld.global.nc the __restrict__ loads use
 __device__ __forceinline__ int ldg_nc_u16(const void* p) { unsigned v; asm volatile("ld.global.nc.u16 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
@@ -684,6 +685,7 @@ __device__ __forceinline__ const void* madw(const void* base, int k, int stride)
     asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(k), "r"(stride), "l"(base));
     return r;
 }
+#endif  // !__HIPCC__
 // P2 (decode-gemv 4): (float) p for |p| < 2^22 as an add on the FMA pipe instead of the quarter-rate I2F: p + 1.5 * 2^23
 // as float bits is exactly 1.5 * 2^23 + p (unit ulp), and the subtraction is exact (Sterbenz), so the value is the
 // conversion's, +0 included

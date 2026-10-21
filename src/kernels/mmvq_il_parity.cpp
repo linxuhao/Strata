@@ -83,6 +83,7 @@ double time_us(F fn, int reps, cudaStream_t s, G gap) {
 }
 // --persist: the matrix `w` (wbytes) persisting in L2 for every kernel on `s`; off: the window cleared
 void persist_window(cudaStream_t s, void* w, std::size_t wbytes, bool on) {
+#if !defined(STRATA_HIP_GFX906)
     cudaStreamAttrValue v{};
     v.accessPolicyWindow.base_ptr = on ? w : nullptr;
     v.accessPolicyWindow.num_bytes = on ? wbytes : 0;
@@ -92,6 +93,10 @@ void persist_window(cudaStream_t s, void* w, std::size_t wbytes, bool on) {
     if (cudaStreamSetAttribute(s, cudaStreamAttributeAccessPolicyWindow, &v) != cudaSuccess) {
         std::printf("--persist: the access policy window was refused: %s\n", cudaGetErrorString(cudaGetLastError()));
     }
+#else
+    (void) s; (void) w; (void) wbytes;   // (no L2 access policy window in the gfx906 compat layer)
+    std::printf("--persist: not available in this build (%s)\n", on ? "on" : "off");
+#endif
 }
 struct Case {
     const char* name;
@@ -438,6 +443,7 @@ int main(int argc, char** argv) {
     }
     cudaStream_t s;
     cudaStreamCreate(&s);
+#if !defined(STRATA_HIP_GFX906)
     if (g_persist || g_ab) {
         int dev = 0, l2 = 0, maxp = 0, maxw = 0;
         cudaGetDevice(&dev);
@@ -450,6 +456,7 @@ int main(int argc, char** argv) {
         std::printf("--persist: L2 %d MiB, max persisting %d MiB, max window %d MiB; set-aside asked %zu MiB -> %s, granted %zu MiB\n",
                     l2 >> 20, maxp >> 20, maxw >> 20, want >> 20, cudaGetErrorString(e), got >> 20);
     }
+#endif
     if (bench) std::printf("bench arms: %s%s%s\n", g_hot ? "hot (one copy) " : "cold (192 MB rotation) ",
                            g_gap_bytes ? ("gap " + std::to_string(g_gap_bytes >> 20) + " MB ").c_str() : "", g_persist ? "persist" : "");
     int bad = 0;

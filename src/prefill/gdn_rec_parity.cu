@@ -612,8 +612,7 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
         }
         if (major < 8 || sms < HV || (size_t) smem < kTcScanSmem<false>) return cudaErrorNotSupported;
     }
-    const GtcScratch sc = gdn_tc_scratch();
-    if (sc.ti == nullptr) return cudaErrorMemoryAllocation;
+    if (gdn_tc_scratch(0).ti == nullptr) return cudaErrorMemoryAllocation;
     {   // once a device
         static bool attrs[64] = {};
         int dev = 0;
@@ -623,10 +622,33 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
             attrs[dev] = true;
         }
     }
-    for (int64_t t0 = 0; t0 < T; t0 += GSB) {
-        const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
-        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kTcPrepSmem, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
-        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
+    // more than one super-block: the preps on the low-priority stream, each on the 22 SMs the scan of the super-block
+    // before (on the high-priority one) leaves idle (GtcOverlap); one super-block: both launches on s
+    const int nsb = (int) ((T + GSB - 1) / GSB);
+    const GtcOverlap& ov = gdn_tc_overlap();
+    const bool overlap = nsb > 1 && ov.ok;
+    const cudaStream_t ps = overlap ? ov.lo : s, ss = overlap ? ov.hi : s;
+    if (overlap) {
+        cudaEventRecord(ov.in, s);
+        cudaStreamWaitEvent(ov.lo, ov.in, 0);
+        cudaStreamWaitEvent(ov.hi, ov.in, 0);
+    }
+    for (int sb = 0; sb < nsb; ++sb) {
+        const int64_t t0 = (int64_t) sb * GSB;
+        const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH), slot = sb & 1;
+        const GtcScratch sc = gdn_tc_scratch(overlap ? slot : 0);
+        if (overlap && sb >= 2) cudaStreamWaitEvent(ps, ov.scan[slot], 0);   // the scan that read the slot
+        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kTcPrepSmem, ps>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+        if (overlap) {
+            cudaEventRecord(ov.prep[slot], ps);
+            cudaStreamWaitEvent(ss, ov.prep[slot], 0);
+        }
+        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, ss>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
+        if (overlap) cudaEventRecord(ov.scan[slot], ss);
+    }
+    if (overlap) {
+        cudaEventRecord(ov.out, ss);
+        cudaStreamWaitEvent(s, ov.out, 0);
     }
     return cudaSuccess;
 }

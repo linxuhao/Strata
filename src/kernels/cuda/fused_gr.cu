@@ -224,13 +224,13 @@ struct GrMulti {
 // d = amax / 127, roundf(x / d), ds = (d, sum) - the bytes the separate launch writes.
 struct GrQ81 { half2 ds; int8_t qs[32]; };
 static_assert(2 * 16 == 32, "two up blocks per q8_1 group");
-__device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
+__device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0, unsigned per_group = 2) {   // per_group: the blocks that own a 32-column group
     __shared__ int last;
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned* c = m.a[0].q8_cnt + d0 / 32;
-        last = atomicAdd(c, 1u) == 1u;
+        last = atomicAdd(c, 1u) == per_group - 1;
         if (last) atomicExch(c, 0u);
     }
     __syncthreads();
@@ -525,6 +525,101 @@ __global__ void __launch_bounds__(THREADS, 4) gr_up75_kernel(GrMulti m) {
         m.a[k].mixed[d0 + col] = s / (float) HC;
     }
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
+}
+
+// P5 (decode-gemv 4): gr_up75_kernel's rows, sums and epilogue over twice the blocks with every load first.  A block
+// owns 8 columns (x 4 streams = 32 rows, 4 a warp: warp w takes rows (c, w), c < 4), 320 blocks at 5 a SM (51
+// registers) - one wave on 70 SMs, where 160 blocks of 512 threads at 2 a SM were 1.14 waves and slower.  A row keeps
+// gr_up75_kernel's lane -> chunk map, its tail trick (lane 8 j + tj holds chunk 32 + tj of the warp's row j) and its
+// xor tree: the same bits.  A lane's five loads issue before the lo staging (gr_up75_kernel's second batch waited for
+// the first batch's dots), and the token arguments are read from shared memory (m.a[lane] is a register-indexed
+// constant-bank read, IMC-miss stalls 1.2 cycles an instruction in ncu).  STRATA_GR_UP75W=1 takes it wherever
+// gr_up75_kernel runs (3+ tokens).
+constexpr int UPW_COLS = 8, UPW_BLOCKS = N / UPW_COLS;   // 320
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS, 5) gr_up75w_kernel(GrMulti m) {
+    constexpr int RPW = HC;   // rows a warp: stream c of column d0 + warp
+    static_assert(UPW_COLS == WARPS && HC == 4 && LR / 8 - 32 == 8, "geometry");
+    __shared__ __align__(16) float lo[MAX_T][LR];
+    __shared__ float g[MAX_T][HC][UPW_COLS];
+    __shared__ __align__(16) FusedGrArgs sa[MAX_T];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const int d0 = blockIdx.x * UPW_COLS;
+    const int tj = lane & 7, ti = lane >> 3;       // tail: chunk 32 + tj of the warp's row ti
+    uint4 wa[RPW], wt;
+#pragma unroll
+    for (int c = 0; c < RPW; ++c)
+        wa[c] = __ldg(reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) (c * N + d0 + warp) * LR) + lane);
+    wt = __ldg(reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) (ti * N + d0 + warp) * LR) + 32 + tj);
+    {   // the T tokens' arguments, one word a thread
+        const int* src = reinterpret_cast<const int*>(m.a);
+        int* dst = reinterpret_cast<int*>(sa);
+        for (int i = t; i < T * int(sizeof(FusedGrArgs) / 4); i += THREADS) dst[i] = src[i];
+    }
+    __syncthreads();
+    for (int k = 0; k < T; ++k)
+        for (int i = t; i < LR; i += THREADS) lo[k][i] = sa[k].lo[i];
+    __syncthreads();
+    float mine[RPW];
+#pragma unroll
+    for (int c = 0; c < RPW; ++c) mine[c] = 0.0f;
+#pragma unroll 1
+    for (int k = 0; k < T; ++k) {
+        const float4* la = reinterpret_cast<const float4*>(lo[k] + lane * 8);
+        const float4* lb = reinterpret_cast<const float4*>(lo[k] + (32 + tj) * 8);
+        const float tb = dot8u(unpack8(wt), lb[0], lb[1]);
+        const float4 x0 = la[0], x1 = la[1];
+        float p[RPW];
+#pragma unroll
+        for (int c = 0; c < RPW; ++c) {
+            const float b = __shfl_sync(0xffffffffu, tb, c * 8 + tj);
+            float acc = dot8u(unpack8(wa[c]), x0, x1);
+            if (lane < 8) acc += b;
+            p[c] = acc;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+            for (int c = 0; c < RPW; ++c) p[c] += __shfl_xor_sync(0xffffffffu, p[c], o);
+        }
+        if (lane == k) {
+#pragma unroll
+            for (int c = 0; c < RPW; ++c) mine[c] = p[c];
+        }
+    }
+    if (lane < T) {
+        const FusedGrArgs& a = sa[lane];
+        const bool apply = a.apply;
+        const int dd = warp;
+        float rv[RPW], wn[RPW];
+        const float bo = apply ? a.bo_prev[d0 + dd] : 0.0f;
+#pragma unroll
+        for (int c = 0; c < RPW; ++c) {
+            rv[c] = a.R[c * N + d0 + dd];
+            wn[c] = a.w_norm[c * N + d0 + dd];
+        }
+#pragma unroll
+        for (int c = 0; c < RPW; ++c) {
+            const int row = c * N + d0 + dd;
+            float x0 = rv[c];
+            if (apply) {
+                x0 = fmaf(bo, 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC), x0);
+                a.R_out[row] = x0;
+            }
+            const float x = x0 * wn[c] * a.rs[c];
+            g[lane][c][dd] = x * sigmoidf_(mine[c]);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPW_COLS; i += THREADS) {
+        const int k = i / UPW_COLS, col = i - k * UPW_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        sa[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0, 32 / UPW_COLS);   // S26 STRATA_QFUSE: 4 blocks own a 32-column group
 }
 
 
@@ -1684,6 +1779,11 @@ bool qfuse_hc_local() {
 }
 // Turing: gr_up75_kernel for 3+ tokens (bitwise gr_up_multi_kernel; fused_gr_bench cold on an RTX 2080 Ti, up incl. a
 // stamp: T 3 27.3 -> 24.6 us, T 4 33.2 -> 28.7, T 6 46.6 -> 36.6); STRATA_GR_UP75=0 / 1 forces it off / on
+// P5: gr_up75w_kernel in gr_up75_kernel's place (STRATA_GR_UP75W=1; unset / 0: gr_up75_kernel)
+bool up75w_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GR_UP75W"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 bool up75_on() {
 #if defined(__HIPCC__)
     return false;
@@ -1845,6 +1945,16 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             case 5: gr_up_multi_kernel<5, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
             case 6: gr_up_multi_kernel<6, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
             default: gr_up_multi_kernel<kFusedGrMaxT, false, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+        }
+    } else if (n_tok >= 3 && up75_on() && up75w_on()) {   // P5: gr_up75_kernel's rows at 512 threads, loads first
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+            case 1: gr_up75w_kernel<1, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 2: gr_up75w_kernel<2, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 3: gr_up75w_kernel<3, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 4: gr_up75w_kernel<4, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 5: gr_up75w_kernel<5, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 6: gr_up75w_kernel<6, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            default: gr_up75w_kernel<kFusedGrMaxT, false><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
         }
     } else if (n_tok >= 3 && up75_on()) {   // T 1-2: gr_up_multi_kernel is as fast or faster (fused_gr_bench, cold)
         switch (no_multi_gr ? kFusedGrMaxT : n_tok) {

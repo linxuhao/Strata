@@ -590,6 +590,8 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
     }
     return cudaSuccess;   // launch errors surface at the caller's check; an error above means nothing ran
 }
+// src/prefill/kernels.cu's tensor-core scan (STRATA_GDN_TC=1): the same text, included there too
+#include "gdn_tc.cuh"
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
@@ -892,6 +894,274 @@ int check_chunked(int64_t T, uint64_t seed) {
     }
     cudaFree(s0); cudaFree(s1); cudaFree(o0); cudaFree(o1);
     return bad ? 1 : 0;
+}
+
+// ------------------------------------------------------------------ the tensor-core scan's fragment self-test (--selftest-frag)
+// One warp each, random inputs, the reference in double on the host: (a) gtc_c2a_tf32 against the fragment rule,
+// (b) a 16x128 . 128x32 product through gtc_prod_state (the f16 split with the state's 2^es and k's 2^8, ldmatrix),
+// (c) a 16x32 . 32x128 update through gtc_update_state (ldmatrix.trans, the 2^ed scale, the accumulator's pre / post
+// scale), (d) a 16x32 . 32x32 product through gtc_prod_yt on tf32x3 with the shuffled A tile, (e) the triangle-skipped
+// tile sets of gtc_prod_yt and gtc_prod_dt against the full ones on triangular T / P: the same bits, since the
+// skipped tiles add exact zeros.  Most bugs of a tensor-core kernel are fragment-layout bugs: these catch them before
+// the kernel does.
+__global__ void st_c2a_kernel(const float* m, float* out) {   // m: 16 x 8 (a C tile), out: a lane's a[4]
+    const int lane = threadIdx.x, gid = lane >> 2, tig = lane & 3;
+    const float c[4] = {m[gid * 8 + 2 * tig], m[gid * 8 + 2 * tig + 1], m[(gid + 8) * 8 + 2 * tig],
+                        m[(gid + 8) * 8 + 2 * tig + 1]};
+    float a[4];
+    gtc_c2a_tf32(c, a);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) out[lane * 4 + q] = a[q];
+}
+__device__ void st_stage_k(uint16_t* kh, uint16_t* kl, const float* k) {   // k: 32 x 128 f32 -> the hi / lo images x 2^8
+    for (int p = threadIdx.x; p < GCH * S / 4; p += 32) {
+        const int t = p / (S / 4), r = (p % (S / 4)) * 4;
+        gtc_split_store4(kh + t * GTC_KP + r, kl + t * GTC_KP + r, *reinterpret_cast<const float4*>(k + t * S + r), 256.0f);
+    }
+    __syncwarp();
+}
+// a 16-row matrix (row stride ld) as 8-column tiles in the C layout: tile j, lane (gid, tig) holds (gid, 8j + 2tig),
+// (gid, 8j + 2tig + 1), (gid + 8, 8j + 2tig), (gid + 8, 8j + 2tig + 1)
+template <int NT> __device__ void st_load_c(float (&c)[NT][4], const float* m, int ld) {
+    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        c[j][0] = m[gid * ld + 8 * j + 2 * tig];
+        c[j][1] = m[gid * ld + 8 * j + 2 * tig + 1];
+        c[j][2] = m[(gid + 8) * ld + 8 * j + 2 * tig];
+        c[j][3] = m[(gid + 8) * ld + 8 * j + 2 * tig + 1];
+    }
+}
+template <int NT> __device__ void st_store_c(const float (&c)[NT][4], float* m, int ld, float scale) {
+    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        m[gid * ld + 8 * j + 2 * tig] = c[j][0] * scale;
+        m[gid * ld + 8 * j + 2 * tig + 1] = c[j][1] * scale;
+        m[(gid + 8) * ld + 8 * j + 2 * tig] = c[j][2] * scale;
+        m[(gid + 8) * ld + 8 * j + 2 * tig + 1] = c[j][3] * scale;
+    }
+}
+template <int NT> __device__ float st_max_abs(const float (&c)[NT][4]) {
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) m = fmaxf(m, fabsf(c[j][q]));
+    return gtc_warp_max(m);
+}
+__global__ void st_state_kernel(const float* a, const float* k, float* out) {   // out (16 x 32) = a (16 x 128) k^T
+    __shared__ __align__(16) uint16_t kh[GCH * GTC_KP], kl[GCH * GTC_KP];
+    st_stage_k(kh, kl, k);
+    float s[16][4];
+    st_load_c<16>(s, a, S);
+    const int es = gtc_scale_exp(st_max_abs<16>(s));
+    float xt[4][4] = {}, qs[4][4] = {};
+    gtc_prod_state(s, gtc_pow2(es), kh, kl, kh, kl, xt, qs);
+    st_store_c<4>(xt, out, GCH, gtc_pow2(-(8 + es)));
+}
+__global__ void st_update_kernel(const float* s0, const float* dd, const float* k, float eL, float* out) {   // out (16 x 128) = eL s0 + dd (16 x 32) k
+    __shared__ __align__(16) uint16_t kh[GCH * GTC_KP], kl[GCH * GTC_KP];
+    st_stage_k(kh, kl, k);
+    float s[16][4], dt[4][4], ddt[4][4];
+    st_load_c<16>(s, s0, S);
+    st_load_c<4>(dt, dd, GCH);
+    const int ed = gtc_scale_exp(st_max_abs<4>(dt));
+    const float sD = gtc_pow2(ed), sPre = eL * gtc_pow2(ed + 8);
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) ddt[j][q] = dt[j][q] * sD;
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) s[j][q] *= sPre;
+    gtc_update_state(s, ddt, kh, kl);
+    st_store_c<16>(s, out, S, gtc_pow2(-(ed + 8)));
+}
+template <bool SKIP> __global__ void st_yt_kernel(const float* y, const float* t, float* out) {   // out (16 x 32) = y t^T
+    __shared__ __align__(16) float st[GCH * GTC_TP];
+    for (int p = threadIdx.x; p < GCH * GCH; p += 32) st[(p / GCH) * GTC_TP + p % GCH] = t[p];
+    __syncwarp();
+    float yt[4][4], dt[4][4] = {};
+    st_load_c<4>(yt, y, GCH);
+    gtc_prod_yt<SKIP>(yt, st, dt);
+    st_store_c<4>(dt, out, GCH, 1.0f);
+}
+template <bool SKIP> __global__ void st_dt_kernel(const float* d, const float* p, float* out) {   // out (16 x 32) = d p^T
+    __shared__ __align__(16) uint16_t ph[GCH * GTC_PP], pl[GCH * GTC_PP];
+    for (int q = threadIdx.x; q < GCH * GCH / 4; q += 32) {
+        const int t = q / (GCH / 4), i = (q % (GCH / 4)) * 4;
+        gtc_split_store4(ph + t * GTC_PP + i, pl + t * GTC_PP + i, *reinterpret_cast<const float4*>(p + t * GCH + i), 256.0f);
+    }
+    __syncwarp();
+    float dt[4][4], ot[4][4] = {};
+    st_load_c<4>(dt, d, GCH);
+    const int ed = gtc_scale_exp(st_max_abs<4>(dt));
+    gtc_prod_dt<SKIP>(dt, gtc_pow2(ed), ph, pl, ot);
+    st_store_c<4>(ot, out, GCH, gtc_pow2(-(ed + 8)));
+}
+struct StRng {   // xorshift64, host side
+    uint64_t s;
+    explicit StRng(uint64_t seed) : s(seed) {}
+    float uni() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return ((float) (s >> 40) + 0.5f) / 16777216.0f; }
+    float gauss() { return std::sqrt(-2.0f * std::log(uni())) * std::cos(6.2831853f * uni()); }
+    float logmag(float lo, float hi) { return (uni() < 0.5f ? -1.0f : 1.0f) * std::pow(10.0f, lo + (hi - lo) * uni()); }
+};
+float* st_upload(const std::vector<float>& v) {
+    float* d = dalloc<float>(v.size());
+    ck(cudaMemcpy(d, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "upload");
+    return d;
+}
+std::vector<float> st_download(const float* d, size_t n) {
+    std::vector<float> v(n);
+    ck(cudaDeviceSynchronize(), "self-test kernel");
+    ck(cudaMemcpy(v.data(), d, n * 4, cudaMemcpyDeviceToHost), "download");
+    return v;
+}
+double st_max_rel(const std::vector<float>& got, const std::vector<double>& ref) {
+    double md = 0.0, mv = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        md = std::max(md, std::fabs((double) got[i] - ref[i]));
+        mv = std::max(mv, std::fabs(ref[i]));
+    }
+    return mv > 0.0 ? md / mv : md;
+}
+int selftest_frag() {
+    std::printf("--selftest-frag: the tensor-core scan's fragment helpers, one warp each\n");
+    int fails = 0;
+    StRng rng(0x5e1f7e57ULL);
+    auto unit_rows = [&](std::vector<float>& k, int rows, int cols) {   // gaussian rows, L2-normalized
+        for (int t = 0; t < rows; ++t) {
+            double ss = 0.0;
+            for (int r = 0; r < cols; ++r) { k[t * cols + r] = rng.gauss(); ss += (double) k[t * cols + r] * k[t * cols + r]; }
+            for (int r = 0; r < cols; ++r) k[t * cols + r] = (float) (k[t * cols + r] / std::sqrt(ss));
+        }
+    };
+    {   // (a) the C -> A (tf32) shuffle against the fragment rule
+        std::vector<float> m(16 * 8);
+        for (float& x : m) x = rng.gauss();
+        float* dm = st_upload(m);
+        float* dout = dalloc<float>(32 * 4);
+        st_c2a_kernel<<<1, 32>>>(dm, dout);
+        const std::vector<float> out = st_download(dout, 32 * 4);
+        int bad = 0;
+        for (int lane = 0; lane < 32; ++lane) {
+            const int gid = lane >> 2, tig = lane & 3;
+            const float want[4] = {m[gid * 8 + tig], m[(gid + 8) * 8 + tig], m[gid * 8 + tig + 4], m[(gid + 8) * 8 + tig + 4]};
+            for (int q = 0; q < 4; ++q) bad += out[lane * 4 + q] != want[q];
+        }
+        std::printf("  (a) gtc_c2a_tf32 (C tile -> tf32 A tile, 8 shuffles): %d of 128 values wrong  %s\n", bad, bad ? "FAIL" : "ok");
+        fails += bad != 0;
+        cudaFree(dm); cudaFree(dout);
+    }
+    {   // (b) X^T = S^T K^T: f16x3 with the state's 2^es and k's 2^8, B by ldmatrix
+        std::vector<float> a(16 * S), k(GCH * S);
+        for (float& x : a) x = rng.logmag(-3.0f, 2.0f);
+        unit_rows(k, GCH, S);
+        std::vector<double> ref(16 * GCH);
+        for (int c = 0; c < 16; ++c)
+            for (int i = 0; i < GCH; ++i) {
+                double v = 0.0;
+                for (int r = 0; r < S; ++r) v += (double) a[c * S + r] * k[i * S + r];
+                ref[c * GCH + i] = v;
+            }
+        float* da = st_upload(a);
+        float* dk = st_upload(k);
+        float* dout = dalloc<float>(16 * GCH);
+        st_state_kernel<<<1, 32>>>(da, dk, dout);
+        const double rel = st_max_rel(st_download(dout, 16 * GCH), ref);
+        const bool bad = !(rel <= 2e-6);
+        std::printf("  (b) X^T = S^T K^T (16x128 . 128x32, f16x3, 2^es 2^8, ldmatrix): max |diff| / max |ref| %.2e  %s\n", rel, bad ? "FAIL" : "ok");
+        fails += bad;
+        cudaFree(da); cudaFree(dk); cudaFree(dout);
+    }
+    {   // (c) S^T = eL S^T + Dd^T K: ldmatrix.trans, 2^ed, the accumulator scaled before and after
+        std::vector<float> s0(16 * S), dd(16 * GCH), k(GCH * S);
+        for (float& x : s0) x = rng.logmag(-3.0f, 2.0f);
+        for (float& x : dd) x = rng.logmag(-3.0f, 2.0f);
+        unit_rows(k, GCH, S);
+        const float eL = 0.25f + 0.75f * rng.uni();
+        std::vector<double> ref(16 * S);
+        for (int c = 0; c < 16; ++c)
+            for (int r = 0; r < S; ++r) {
+                double v = (double) eL * s0[c * S + r];
+                for (int i = 0; i < GCH; ++i) v += (double) dd[c * GCH + i] * k[i * S + r];
+                ref[c * S + r] = v;
+            }
+        float* ds = st_upload(s0);
+        float* dd_ = st_upload(dd);
+        float* dk = st_upload(k);
+        float* dout = dalloc<float>(16 * S);
+        st_update_kernel<<<1, 32>>>(ds, dd_, dk, eL, dout);
+        const double rel = st_max_rel(st_download(dout, 16 * S), ref);
+        const bool bad = !(rel <= 2e-6);
+        std::printf("  (c) S^T = eL S^T + Dd^T K (16x32 . 32x128, f16x3, ldmatrix.trans, 2^ed pre / post scale): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
+        fails += bad;
+        cudaFree(ds); cudaFree(dd_); cudaFree(dk); cudaFree(dout);
+    }
+    {   // (d) D^T = Y^T T^T on tf32x3 through gtc_c2a_tf32, a full random T
+        std::vector<float> y(16 * GCH), t(GCH * GCH);
+        for (float& x : y) x = rng.logmag(-3.0f, 2.0f);
+        for (float& x : t) x = rng.logmag(-2.0f, 3.0f);
+        std::vector<double> ref(16 * GCH);
+        for (int c = 0; c < 16; ++c)
+            for (int i = 0; i < GCH; ++i) {
+                double v = 0.0;
+                for (int ip = 0; ip < GCH; ++ip) v += (double) y[c * GCH + ip] * t[i * GCH + ip];
+                ref[c * GCH + i] = v;
+            }
+        float* dy = st_upload(y);
+        float* dt_ = st_upload(t);
+        float* dout = dalloc<float>(16 * GCH);
+        st_yt_kernel<false><<<1, 32>>>(dy, dt_, dout);
+        const double rel = st_max_rel(st_download(dout, 16 * GCH), ref);
+        const bool bad = !(rel <= 2e-6);
+        std::printf("  (d) D^T = Y^T T^T (16x32 . 32x32, tf32x3, c2a): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
+        fails += bad;
+        cudaFree(dy); cudaFree(dt_); cudaFree(dout);
+    }
+    {   // (e) the triangle-skipped tile sets against the full ones: T unit lower triangular, P lower triangular
+        std::vector<float> y(16 * GCH), t(GCH * GCH), d(16 * GCH), p(GCH * GCH);
+        for (float& x : y) x = rng.logmag(-3.0f, 2.0f);
+        for (float& x : d) x = rng.logmag(-3.0f, 2.0f);
+        for (int i = 0; i < GCH; ++i)
+            for (int j = 0; j < GCH; ++j) {
+                t[i * GCH + j] = j < i ? rng.logmag(-2.0f, 3.0f) : (j == i ? 1.0f : 0.0f);
+                p[i * GCH + j] = j <= i ? 2.0f * rng.uni() - 1.0f : 0.0f;
+            }
+        std::vector<double> ref_d(16 * GCH), ref_o(16 * GCH);
+        for (int c = 0; c < 16; ++c)
+            for (int i = 0; i < GCH; ++i) {
+                double v = 0.0, w = 0.0;
+                for (int ip = 0; ip < GCH; ++ip) { v += (double) y[c * GCH + ip] * t[i * GCH + ip]; w += (double) d[c * GCH + ip] * p[i * GCH + ip]; }
+                ref_d[c * GCH + i] = v;
+                ref_o[c * GCH + i] = w;
+            }
+        float* dy = st_upload(y);
+        float* dt_ = st_upload(t);
+        float* dd_ = st_upload(d);
+        float* dp = st_upload(p);
+        float* full = dalloc<float>(16 * GCH);
+        float* skip = dalloc<float>(16 * GCH);
+        st_yt_kernel<false><<<1, 32>>>(dy, dt_, full);
+        st_yt_kernel<true><<<1, 32>>>(dy, dt_, skip);
+        const std::vector<float> f1 = st_download(full, 16 * GCH), s1 = st_download(skip, 16 * GCH);
+        const unsigned long long diff1 = std::memcmp(f1.data(), s1.data(), 16 * GCH * 4) != 0 ? diff_words(full, skip, 16 * GCH * 4) : 0;
+        const double rel1 = st_max_rel(s1, ref_d);
+        st_dt_kernel<false><<<1, 32>>>(dd_, dp, full);
+        st_dt_kernel<true><<<1, 32>>>(dd_, dp, skip);
+        const std::vector<float> f2 = st_download(full, 16 * GCH), s2 = st_download(skip, 16 * GCH);
+        const unsigned long long diff2 = std::memcmp(f2.data(), s2.data(), 16 * GCH * 4) != 0 ? diff_words(full, skip, 16 * GCH * 4) : 0;
+        const double rel2 = st_max_rel(s2, ref_o);
+        const bool bad = diff1 != 0 || diff2 != 0 || !(rel1 <= 2e-6) || !(rel2 <= 2e-6);
+        std::printf("  (e) triangle skipping: D^T 10 of 16 tiles %llu words differ (vs FP64 %.2e), o^T 6 of 8 tiles %llu words differ (vs FP64 %.2e)  %s\n",
+                    diff1, rel1, diff2, rel2, bad ? "FAIL" : "ok");
+        fails += bad;
+        cudaFree(dy); cudaFree(dt_); cudaFree(dd_); cudaFree(dp); cudaFree(full); cudaFree(skip);
+    }
+    std::printf("--selftest-frag: %d failures\n", fails);
+    return fails;
 }
 
 float median(std::vector<float> v) {
@@ -1357,13 +1627,20 @@ void fewer_sms(int64_t T) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool do_bench = false;
-    for (int i = 1; i < argc; ++i)
+    bool do_bench = false, do_self = false;
+    for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
+        if (std::strcmp(argv[i], "--selftest-frag") == 0) do_self = true;
+    }
     cudaDeviceProp p{};
     ck(cudaGetDeviceProperties(&p, 0), "device");
     std::printf("gdn_rec_parity on %s (sm_%d%d)\n", p.name, p.major, p.minor);
     int fails = 0;
+    if (do_self) {   // the tensor-core helpers alone
+        fails = selftest_frag();
+        std::printf("gdn_rec_parity: %d failures\n", fails);
+        return fails ? 1 : 0;
+    }
     const int64_t Ts[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 257, 1000, 4099};
     uint64_t seed = 11;
     for (const int64_t T : Ts) fails += check_bits(T, seed++);

@@ -951,8 +951,9 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
 }
 
 // Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
+template <int NT = THREADS>
 __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int k0 = 0) {
-    for (int i = t; i < T * (H_TILE / 4); i += THREADS) {
+    for (int i = t; i < T * (H_TILE / 4); i += NT) {
         const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
         const float* src = m.xn + (size_t) (k0 + k) * D + (size_t) h * H_TILE + (size_t) s4 * 4;
         cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
@@ -1011,6 +1012,87 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
         }
         __syncthreads();                                // every warp is done with buffer h & 1
         if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, k0);
+        cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+    // lane k writes token k (every lane holds every sum after the xor reduction)
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) {
+            m.a[k0 + k].inject_out[row] = s[k];
+        } else {
+            const float x = s[k] / (float) HC;
+            m.a[k0 + k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// plan-decode step 4 (hc-1; STRATA_HC_DOWN5=1): the staged down kernel at 5 warps = 5 rows a block: 64 blocks + the
+// inject block = 65 on the CMP 170HX's 70 SMs, one per SM (the 41-block launch above leaves 29 SMs idle and each warp's
+// 2,843-instruction chain shares its SM with 7 others).  Every warp runs the SAME per-row loop as gr_down_staged_kernel
+// (the same tiles, lane / chunk order, warp_sum and epilogue), so each row's bits are the plain read's: bitwise.
+constexpr int THREADS5 = 160, WARPS5 = THREADS5 / 32, DOWN5_BLOCKS = LR / WARPS5;   // 64
+static_assert(LR % WARPS5 == 0 && WARPS5 >= HC, "5 rows a block; the inject block's HC rows fit its warps");
+template <int MAX_T, bool EXACT_T>
+__global__ void __launch_bounds__(THREADS5) gr_down_staged5_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    // sm_75: a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
+    // (row, token) is summed by one warp exactly as before - only more blocks share the card (#down-tg)
+    const int k0 = EXACT_T ? (int) blockIdx.y * MAX_T : 0;
+    const bool inject_block = blockIdx.x == DOWN5_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * WARPS5 + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    stage_htile<THREADS5>(m, T, 0, hbuf, t, k0);
+    cp_async_commit();
+    stage_htile<THREADS5>(m, T, 1, hbuf + buf_f4, t, k0);
+    cp_async_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+        if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
+        else cp_async_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();                                // every warp is done with buffer h & 1
+        if (h + 2 < N_HTILES) stage_htile<THREADS5>(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, k0);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
         if (h + 1 < N_HTILES) {
 #pragma unroll
@@ -1116,6 +1198,12 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<6, true>, 6);
         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        set_staged_attr(gr_down_staged5_kernel<1, true>, 1);   // STRATA_HC_DOWN5
+        set_staged_attr(gr_down_staged5_kernel<2, true>, 2);
+        set_staged_attr(gr_down_staged5_kernel<3, true>, 3);
+        set_staged_attr(gr_down_staged5_kernel<4, true>, 4);
+        set_staged_attr(gr_down_staged5_kernel<5, true>, 5);
+        set_staged_attr(gr_down_staged5_kernel<6, true>, 6);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -1157,6 +1245,15 @@ namespace {
 bool gr_down_max4() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_GR_DOWN_MAX4");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// STRATA_HC_DOWN5=1 (opt-in, plan-decode step 4): the staged down projection on 65 blocks of 5 rows (gr_down_staged5_kernel)
+bool down5_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HC_DOWN5");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
@@ -1287,7 +1384,14 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             const int tg = down_tg(ct);
-            if (exact_t && tg > 0 && tg < ct) {
+            if (down5_on() && exact_t && ct <= 6 && !(tg > 0 && tg < ct)) {   // STRATA_HC_DOWN5: 5 rows a block, 65 blocks
+                if (ct == 1) gr_down_staged5_kernel<1, true><<<DOWN5_BLOCKS + 1, THREADS5, smem, st>>>(c);
+                else if (ct == 2) gr_down_staged5_kernel<2, true><<<DOWN5_BLOCKS + 1, THREADS5, smem, st>>>(c);
+                else if (ct == 3) gr_down_staged5_kernel<3, true><<<DOWN5_BLOCKS + 1, THREADS5, smem, st>>>(c);
+                else if (ct == 4) gr_down_staged5_kernel<4, true><<<DOWN5_BLOCKS + 1, THREADS5, smem, st>>>(c);
+                else if (ct == 5) gr_down_staged5_kernel<5, true><<<DOWN5_BLOCKS + 1, THREADS5, smem, st>>>(c);
+                else gr_down_staged5_kernel<6, true><<<DOWN5_BLOCKS + 1, THREADS5, smem, st>>>(c);
+            } else if (exact_t && tg > 0 && tg < ct) {
                 const dim3 grid(DOWN_BLOCKS + 1, (unsigned) (ct / tg));
                 const size_t sm_g = (size_t) tg * per_tok;
                 if (tg == 1) gr_down_staged_kernel<1, true><<<grid, THREADS, sm_g, st>>>(c);

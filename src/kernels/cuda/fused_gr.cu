@@ -3360,6 +3360,11 @@ void init_dev(int dev) {
     }
     cudaGetLastError();
     if (max_t == 0) { off("the shared-memory opt-in (" + std::to_string(optin) + " B) holds no token"); return; }
+    // STRATA_HC_FUSED_MAX_T (default 2): larger reads keep the three kernels.  nsys of the 3K decode on the CMP 170HX: the
+    // fused read 26.5 us at T = 1 and 32.0 at T = 2 against 33.2 for the three kernels (gr_up_multi there), but 35.9 at
+    // T = 3 against 34.3 (gr_up75's 18 warps per SM beat one block of 8 on the up rows)
+    static const int cap = [] { const char* v = std::getenv("STRATA_HC_FUSED_MAX_T"); return v != nullptr ? std::atoi(v) : 2; }();
+    if (max_t > cap) max_t = cap < 1 ? 1 : cap;
     if (cudaMalloc((void**) &d.bar, (size_t) kSlots * W_WORDS * sizeof(unsigned)) != cudaSuccess ||
         cudaMemset(d.bar, 0, (size_t) kSlots * W_WORDS * sizeof(unsigned)) != cudaSuccess ||
         cudaHostAlloc((void**) &d.abort_h, (size_t) kSlots * 32 * sizeof(unsigned), cudaHostAllocMapped) != cudaSuccess ||

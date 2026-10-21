@@ -49,15 +49,17 @@ constexpr size_t kTcScanSmem = 2 * (4 * GCH * GTC_KP * 2 + GCH * GTC_VP * 4 + (N
 static_assert(kTcScanSmem<false> == 123920 && kTcScanSmem<true> == 159760, "gdn_tc.cuh: the shared-memory plan");
 
 // the warp's largest of non-negative floats: their bits order as unsigned integers, so one redux.sync (sm_80).  Under
-// the active mask rather than the full one: the callers are whole warps, and where the compiler cannot prove it (a
-// warp-uniform early return, as the stager form had) it guards every full-mask warp operation with a reconvergence
-// call that saves and restores registers around it.
+// the full mask: __activemask() does not reconverge the warp (CUDA guide), and the first call of the scan follows a
+// lane-divergent branch (the L2 prefetch of tokens past the end, in the chunk two before the end whenever
+// 0 < T - f_t0 < 32), so with it the lanes could reduce under a partial mask and disagree on es.  The harness build
+// happened to close that branch (BSYNC) before the REDUX.MAX; the engine's build is a separate compile that nothing
+// checks.  The kernel has no early return, so the full mask costs no reconvergence code.
 __device__ __forceinline__ float gtc_warp_max(float v) {
 #if STRATA_GDN_TC_SM80
-    return __uint_as_float(__reduce_max_sync(__activemask(), __float_as_uint(v)));
+    return __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(v)));
 #else
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(__activemask(), v, o));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 #endif
 }
@@ -177,7 +179,7 @@ __device__ __forceinline__ void gtc_c2a_tf32(const float (&c)[4], float (&a)[4])
     const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int src0 = 4 * gid + (tig >> 1), src1 = src0 + 2;
     const bool odd = tig & 1;
-    const unsigned mk = __activemask();   // a whole warp (see gtc_warp_max)
+    const unsigned mk = 0xffffffffu;   // the whole warp (see gtc_warp_max)
     const float x0 = __shfl_sync(mk, c[0], src0), x1 = __shfl_sync(mk, c[1], src0);
     const float x2 = __shfl_sync(mk, c[2], src0), x3 = __shfl_sync(mk, c[3], src0);
     const float y0 = __shfl_sync(mk, c[0], src1), y1 = __shfl_sync(mk, c[1], src1);

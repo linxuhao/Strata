@@ -349,6 +349,13 @@ __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restric
     const int qh = blockIdx.y, ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int64_t tb = t0 + (int64_t) ch * GCH;
     const int n = (int) min((int64_t) GCH, T - tb);
+    // after the Gram: warps j and VPK + j take value head j (lane i: token i), the first A, the solve and T, the
+    // second P and the token scalars; their beta and gate (past the end: gate 0, beta 0, no effect on S) are loaded
+    // now so that they are in by then
+    const int j = warp % VPK, vh = qh + j * HK, i = lane;
+    const bool pv = warp < 2 * VPK && i < n;
+    const float b = pv ? beta[(tb + i) * HV + vh] : 0.0f;
+    float gam = pv ? gate[(tb + i) * HV + vh] : 0.0f;
     {   // k and q as float4, every load issued before the first store; the images to shared and to global
         constexpr int NP = GCH * S / 4 / 256;   // float4 a thread, each of k and q
         float4 kv[NP], qv[NP];
@@ -398,45 +405,50 @@ __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restric
             }
     }
     __syncthreads();
-    if (warp >= VPK) return;
-    const int vh = qh + warp * HK, i = lane;   // warp j: value head j of the key head; lane i: token i (column i)
-    float* a = sa + warp * GCH * GTP;
-    const float b = i < n ? beta[(tb + i) * HV + vh] : 0.0f;
-    float gam = i < n ? gate[(tb + i) * HV + vh] : 0.0f;   // past the end: gate 0, beta 0 (no effect on S)
+    if (warp >= 2 * VPK) return;
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
         const float u = __shfl_up_sync(0xffffffffu, gam, o);
         if (lane >= o) gam += u;
     }
+    if (warp >= VPK) {   // P = exp(gamma_t - gamma_i) q_t.k_i (i <= t) x 2^8 as f16 hi / lo; the scalars
+        uint16_t* Ph = pi + ((int64_t) ch * HV + vh) * 2 * GCH * GCH;
+        uint16_t* Pl = Ph + GCH * GCH;
+#pragma unroll
+        for (int t = 0; t < GCH; ++t) {
+            const float gt = __shfl_sync(0xffffffffu, gam, t);
+            const float p = (i <= t ? expf(gt - gam) * sqk[t * GTP + i] : 0.0f) * 256.0f;
+            const __half hi = __float2half_rn(p);
+            Ph[t * GCH + i] = __half_as_ushort(hi);
+            Pl[t * GCH + i] = __half_as_ushort(__float2half_rn(p - __half2float(hi)));
+        }
+        const float gL = __shfl_sync(0xffffffffu, gam, GCH - 1);
+        sc[((int64_t) ch * HV + vh) * GCH + i] = make_float4(b, expf(gam), expf(gL - gam), gam);
+        return;
+    }
+    float* a = sa + j * GCH * GTP;
+#pragma unroll
     for (int t = 0; t < GCH; ++t) {
         const float gt = __shfl_sync(0xffffffffu, gam, t), bt = __shfl_sync(0xffffffffu, b, t);
         a[t * GTP + i] = i < t ? bt * expf(gt - gam) * skk[t * GTP + i] : (i == t ? 1.0f : 0.0f);
     }
     __syncwarp();
-    // T = (I + A)^-1 by forward substitution, row by row in place: T[t][i] = -sum_{k < t} A[t][k] T[k][i] over the
-    // finished rows (diagonal 1, zeros above it: the terms k < i add an exact 0, so the same bits as summing from k = i)
-    // - a trip the whole warp shares, so the loads go ahead of the sums
+    // T = (I + A)^-1 by forward substitution, row by row: T[t][i] = -sum_{k < t} A[t][k] T[k][i] over the finished
+    // rows (diagonal 1, zeros above it: the terms k < i add an exact 0, so the same bits as summing from k = i).
+    // Lane i keeps its column T[.][i] in registers, so a row needs only A's row t (a broadcast load a term) and A
+    // is never written: no store and no __syncwarp a row
+    float tv[GCH];
+    tv[0] = i == 0 ? 1.0f : 0.0f;
+#pragma unroll
     for (int t = 1; t < GCH; ++t) {
         float v = 0.0f;
-#pragma unroll 8
-        for (int k = 0; k < t; ++k) v = fmaf(-a[t * GTP + k], a[k * GTP + i], v);
-        __syncwarp();
-        if (i < t) a[t * GTP + i] = v;
-        __syncwarp();
+#pragma unroll
+        for (int k = 0; k < t; ++k) v = fmaf(-a[t * GTP + k], tv[k], v);
+        tv[t] = i < t ? v : (i == t ? 1.0f : 0.0f);
     }
     float* T_ = tm + ((int64_t) ch * HV + vh) * GCH * GCH;
-    uint16_t* Ph = pi + ((int64_t) ch * HV + vh) * 2 * GCH * GCH;
-    uint16_t* Pl = Ph + GCH * GCH;
-    for (int t = 0; t < GCH; ++t) {
-        const float gt = __shfl_sync(0xffffffffu, gam, t);
-        T_[t * GCH + i] = a[t * GTP + i];
-        const float p = (i <= t ? expf(gt - gam) * sqk[t * GTP + i] : 0.0f) * 256.0f;
-        const __half hi = __float2half_rn(p);
-        Ph[t * GCH + i] = __half_as_ushort(hi);
-        Pl[t * GCH + i] = __half_as_ushort(__float2half_rn(p - __half2float(hi)));
-    }
-    const float gL = __shfl_sync(0xffffffffu, gam, GCH - 1);
-    sc[((int64_t) ch * HV + vh) * GCH + i] = make_float4(b, expf(gam), expf(gL - gam), gam);
+#pragma unroll
+    for (int t = 0; t < GCH; ++t) T_[t * GCH + i] = tv[t];
 }
 
 // ---- the scan: a block per value head (48 blocks, one wave on 48 of the CMP 170HX's 70 SMs), 8 consumer warps of 16

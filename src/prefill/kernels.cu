@@ -1217,10 +1217,11 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
     return cudaSuccess;   // launch errors surface at the caller's check; an error above means nothing ran
 }
 // STRATA_GDN_TC=1: gdn_rec_chunked with the scan on the tensor cores (gdn_tc_scan_kernel, gdn_tc.cuh): the same prep
-// and scratch, 48 blocks of 256 threads in one wave.  An error return means nothing was launched: the card is below
-// sm_80, has fewer than 48 SMs, or less than 121 KB of shared memory a block.  Not called by the dispatch yet.
-cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
-                       cudaStream_t s) {
+// and scratch, 48 blocks in one wave.  An error return means nothing was launched: the card is below sm_80, has fewer
+// than 48 SMs, or less than 121 KB of shared memory a block.  Not called by the dispatch yet.
+template <bool STAGERS>
+cudaError_t gdn_rec_tc_v(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                         cudaStream_t s) {
     if (T <= 0) return cudaSuccess;
     {
         int dev = 0, major = 0, sms = 0, smem = 0;
@@ -1239,22 +1240,27 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
     const int nb = (int) ((std::min<int64_t>(GSB, T) + GCH - 1) / GCH);
     const size_t tsz = (size_t) nb * HV * GCH * GCH;
     float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
+    constexpr int NT = (GTC_CW + (STAGERS ? 2 : 0)) * 32;
     {   // once a device
         static bool attrs[64] = {};
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev >= 0 && dev < 64 && !attrs[dev]) {
             cudaFuncSetAttribute(gdn_chunk_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kChunkPrepSmem);
-            cudaFuncSetAttribute(gdn_tc_scan_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
+            cudaFuncSetAttribute(gdn_tc_scan_kernel<false, STAGERS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
             attrs[dev] = true;
         }
     }
     for (int64_t t0 = 0; t0 < T; t0 += GSB) {
         const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
         gdn_chunk_prep_kernel<<<dim3((unsigned) nch, HK), 256, kChunkPrepSmem, s>>>(h, gate, beta, tm, pm, gm, t0, T);
-        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, beta, tm, pm, gm, y, t0, nch, T);
+        gdn_tc_scan_kernel<false, STAGERS><<<HV, NT, kTcScanSmem<false>, s>>>(state, h, beta, tm, pm, gm, y, t0, nch, T);
     }
     return cudaSuccess;
+}
+cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                       cudaStream_t s) {
+    return gdn_rec_tc_v<true>(state, h, gate, beta, y, T, s);
 }
 #endif
 #if defined(__HIPCC__)   // the Aurora (gfx11) recurrence kernels: AMD builds only

@@ -48,10 +48,18 @@ constexpr size_t kTcScanSmem = 2 * (4 * GCH * GTC_KP * 2 + GCH * GTC_VP * 4 + (N
                                     GCH * GTC_TP * 4 + 2 * GCH * GTC_PP * 2 + GCH * 16 + (NORM ? GCH * GTC_CW * 4 : 0)) + 16;
 static_assert(kTcScanSmem<false> == 123920 && kTcScanSmem<true> == 159760, "gdn_tc.cuh: the shared-memory plan");
 
+// the warp's largest of non-negative floats: their bits order as unsigned integers, so one redux.sync (sm_80).  Under
+// the active mask rather than the full one: the callers are whole warps, and after the stager warps' return the
+// compiler cannot prove it and would guard every full-mask warp operation with a reconvergence call that saves and
+// restores registers around it (264 B of stack a thread).
 __device__ __forceinline__ float gtc_warp_max(float v) {
+#if STRATA_GDN_TC_SM80
+    return __uint_as_float(__reduce_max_sync(__activemask(), __float_as_uint(v)));
+#else
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(__activemask(), v, o));
     return v;
+#endif
 }
 __device__ __forceinline__ float gtc_pow2(int e) { return __int_as_float((e + 127) << 23); }   // 2^e, |e| < 127
 // the power of two that puts m = max |x| >= 0 in [2^14, 2^15): f16 hi never overflows (65504) and the low part of
@@ -169,10 +177,11 @@ __device__ __forceinline__ void gtc_c2a_tf32(const float (&c)[4], float (&a)[4])
     const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
     const int src0 = 4 * gid + (tig >> 1), src1 = src0 + 2;
     const bool odd = tig & 1;
-    const float x0 = __shfl_sync(0xffffffffu, c[0], src0), x1 = __shfl_sync(0xffffffffu, c[1], src0);
-    const float x2 = __shfl_sync(0xffffffffu, c[2], src0), x3 = __shfl_sync(0xffffffffu, c[3], src0);
-    const float y0 = __shfl_sync(0xffffffffu, c[0], src1), y1 = __shfl_sync(0xffffffffu, c[1], src1);
-    const float y2 = __shfl_sync(0xffffffffu, c[2], src1), y3 = __shfl_sync(0xffffffffu, c[3], src1);
+    const unsigned mk = __activemask();   // a whole warp (see gtc_warp_max)
+    const float x0 = __shfl_sync(mk, c[0], src0), x1 = __shfl_sync(mk, c[1], src0);
+    const float x2 = __shfl_sync(mk, c[2], src0), x3 = __shfl_sync(mk, c[3], src0);
+    const float y0 = __shfl_sync(mk, c[0], src1), y1 = __shfl_sync(mk, c[1], src1);
+    const float y2 = __shfl_sync(mk, c[2], src1), y3 = __shfl_sync(mk, c[3], src1);
     a[0] = odd ? x1 : x0; a[1] = odd ? x3 : x2; a[2] = odd ? y1 : y0; a[3] = odd ? y3 : y2;
 }
 
@@ -286,21 +295,34 @@ __device__ __forceinline__ void gtc_update_state(float (&s)[16][4], const float 
 
 // ---- the scan: a block per value head (48 blocks, one wave on 48 of the CMP 170HX's 70 SMs), 8 consumer warps of 16
 // value columns each walking every chunk of the super-block with their state slice in registers (written back at the
-// end as gdn_chunk_scan_kernel does), the same prep scratch (tm, pm, gm).  v0: the 256 threads stage cooperatively
-// and one __syncthreads a chunk publishes the buffer just staged and ends every read of the other one.  The next
-// chunk's v goes by cp.async at the chunk's start; its k and q rows (split to f16 hi / lo in registers, so not by
-// cp.async), T, P and the token scalars are loaded, split and stored after the state update, where only the 64 state
-// registers are live (held across the products they cost 32 registers a thread and ptxas spilled at 255), and the
-// rows of the chunk after next are prefetched into L2 at the chunk's start so those loads are L2 hits.
+// end as gdn_chunk_scan_kernel does), the same prep scratch (tm, pm, gm).
+// STAGERS: two more warps stage the chunks (k / q rows loaded, split to f16 hi / lo and stored - not cp.async, the
+// split needs the value in a register - v by cp.async, T copied, P split, the token scalars) a chunk ahead of the
+// consumers, handed over with named barriers: the consumers bar.sync FULL(b) at a chunk's start and bar.arrive
+// EMPTY(b) at its end, the stagers bar.sync EMPTY(b) before refilling a buffer and bar.arrive FULL(b) after; 320
+// threads, 200 registers a thread.  Chunks 0 and 1 are staged without waiting; the stager of chunk 2 waits for the
+// consumers' arrive at the end of chunk 0, so there is no cycle.
+// Without STAGERS (v0, 256 threads): the consumers stage cooperatively and one __syncthreads a chunk publishes the
+// buffer just staged and ends every read of the other one.  The next chunk's v goes by cp.async at the chunk's
+// start; its k and q rows, T, P and scalars are loaded, split and stored after the state update, where only the 64
+// state registers are live (held across the products they cost 32 registers a thread and ptxas spilled at 255), and
+// the rows of the chunk after next are prefetched into L2 at the chunk's start so those loads are L2 hits.
 // NORM (step 5: the output norm fused, the FP16 output written here) is not implemented yet; oc_out takes the FP32
 // output as gdn_chunk_scan_kernel writes it.
-template <bool NORM>
-__global__ void __launch_bounds__(GTC_CW * 32, 1) gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                                   const float* __restrict__ beta, const float* __restrict__ tm,
-                                                                   const float* __restrict__ pm, const float* __restrict__ gm,
-                                                                   float* __restrict__ oc_out, int64_t t0, int nch, int64_t T) {
+__device__ __forceinline__ void gtc_bar_sync(int id, int count) {
+    asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(count) : "memory");
+}
+__device__ __forceinline__ void gtc_bar_arrive(int id, int count) {
+    asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(count) : "memory");
+}
+template <bool NORM, bool STAGERS>
+__global__ void __launch_bounds__((GTC_CW + (STAGERS ? 2 : 0)) * 32, 1)
+gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ beta,
+                   const float* __restrict__ tm, const float* __restrict__ pm, const float* __restrict__ gm,
+                   float* __restrict__ oc_out, int64_t t0, int nch, int64_t T) {
     static_assert(!NORM, "gdn_tc_scan_kernel: the fused output norm is not implemented yet");
-    constexpr int NT = GTC_CW * 32;
+    constexpr int NT = (GTC_CW + (STAGERS ? 2 : 0)) * 32, NS = STAGERS ? 64 : NT;   // threads; staging threads
+    constexpr int BAR_FULL = 1, BAR_EMPTY = 3;                                     // named barriers FULL(b), EMPTY(b)
     extern __shared__ __align__(16) unsigned char gtc_sm[];
     uint16_t* kh = reinterpret_cast<uint16_t*>(gtc_sm);                 // [2][GCH][GTC_KP]  f16 of k x 2^8 (hi)
     uint16_t* kl = kh + 2 * GCH * GTC_KP;                               // [2][GCH][GTC_KP]  what hi left out (lo)
@@ -314,71 +336,89 @@ __global__ void __launch_bounds__(GTC_CW * 32, 1) gdn_tc_scan_kernel(float* __re
     float* seL = reinterpret_cast<float*>(sc + 2 * GCH);                // [2]  exp(gL)
     const int vh = blockIdx.x, qhd = vh % HK;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
-    const int c0 = 16 * warp;   // the warp's value columns c0 + gid and c0 + gid + 8
     const size_t rs = (size_t) HV * S;
-    constexpr int KQ4 = 2 * GCH * S / 4 / NT, V4 = GCH * S / 4 / NT;   // float4 of k and q, of v, a thread a chunk
-    auto kq_at = [&](int m, bool& isq, int& t, int& r) {
-        const int p = tid + NT * m;
+    // staging in pieces: k and q rows as 2 x GCH x S / 4 float4 (piece p: q from GCH x S / 4 on, token t, floats
+    // r..r + 3), v as GCH x S / 4, T and P as GCH x GCH / 4 each; NS threads take the pieces p = stid + NS m
+    auto kq_at = [&](int p, bool& isq, int& t, int& r) {
         isq = p >= GCH * S / 4;
         const int pp = p & (GCH * S / 4 - 1);
         t = pp / (S / 4);
         r = (pp % (S / 4)) * 4;
     };
-    auto load_kq = [&](int64_t c_t0, int n, float4 (&kq)[KQ4]) {   // rows past the chunk's end: zero
-#pragma unroll
-        for (int m = 0; m < KQ4; ++m) {
-            bool isq; int t, r;
-            kq_at(m, isq, t, r);
-            kq[m] = t < n ? __ldg(reinterpret_cast<const float4*>(h + (c_t0 + t) * C + (isq ? 0 : HK * S) + qhd * S + r))
-                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        }
+    auto load_kq4 = [&](int p, int64_t c_t0, int n) {   // rows past the chunk's end: zero
+        bool isq; int t, r;
+        kq_at(p, isq, t, r);
+        return t < n ? __ldg(reinterpret_cast<const float4*>(h + (c_t0 + t) * C + (isq ? 0 : HK * S) + qhd * S + r))
+                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     };
-    auto store_kq = [&](int b, const float4 (&kq)[KQ4]) {
-#pragma unroll
-        for (int m = 0; m < KQ4; ++m) {
-            bool isq; int t, r;
-            kq_at(m, isq, t, r);
-            const int o = (b * GCH + t) * GTC_KP + r;
-            gtc_split_store4((isq ? qh : kh) + o, (isq ? ql : kl) + o, kq[m], 256.0f);
-        }
+    auto store_kq4 = [&](int b, int p, float4 v) {
+        bool isq; int t, r;
+        kq_at(p, isq, t, r);
+        const int o = (b * GCH + t) * GTC_KP + r;
+        gtc_split_store4((isq ? qh : kh) + o, (isq ? ql : kl) + o, v, 256.0f);
     };
-    auto stage_v = [&](int b, int64_t c_t0, int n) {
-#pragma unroll
-        for (int m = 0; m < V4; ++m) {
-            const int p = tid + NT * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
-            float* dst = sv + (b * GCH + t) * GTC_VP + r;
-            if (t < n) gdn_cp16(dst, h + (c_t0 + t) * C + 2 * HK * S + vh * S + r);
-            else *reinterpret_cast<float4*>(dst) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        }
+    auto stage_v4 = [&](int b, int p, int64_t c_t0, int n) {
+        const int t = p / (S / 4), r = (p % (S / 4)) * 4;
+        float* dst = sv + (b * GCH + t) * GTC_VP + r;
+        if (t < n) gdn_cp16(dst, h + (c_t0 + t) * C + 2 * HK * S + vh * S + r);
+        else *reinterpret_cast<float4*>(dst) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     };
-    // a chunk's T and P rows (the prep's f32 [GCH][GCH]): a float4 of each a thread
-    auto load_tp = [&](int ch, float4& t4, float4& p4) {
-        const int t = tid / (GCH / 4), i = (tid % (GCH / 4)) * 4;
+    auto load_tp4 = [&](int ch, int p, float4& t4, float4& p4) {   // the prep's f32 [GCH][GCH] rows
+        const int t = p / (GCH / 4), i = (p % (GCH / 4)) * 4;
         const int64_t at = (((int64_t) ch * HV + vh) * GCH + t) * GCH + i;
         t4 = __ldg(reinterpret_cast<const float4*>(tm + at));
         p4 = __ldg(reinterpret_cast<const float4*>(pm + at));
     };
-    auto store_tp = [&](int b, float4 t4, float4 p4) {
-        const int t = tid / (GCH / 4), i = (tid % (GCH / 4)) * 4;
+    auto store_tp4 = [&](int b, int p, float4 t4, float4 p4) {
+        const int t = p / (GCH / 4), i = (p % (GCH / 4)) * 4;
         *reinterpret_cast<float4*>(st + (b * GCH + t) * GTC_TP + i) = t4;
         const int o = (b * GCH + t) * GTC_PP + i;
         gtc_split_store4(ph + o, pl + o, p4, 256.0f);
     };
-    // the token scalars, warp 0, a lane per token: beta (0 past the chunk's end, as the prep's gate 0 keeps gamma)
+    // the token scalars, one warp, a lane per token: beta (0 past the chunk's end, as the prep's gate 0 keeps gamma)
     auto load_sc = [&](int ch, int64_t c_t0, int n, float& bet, float& gam, float& gL) {
-        if (warp == 0) {
-            bet = lane < n ? __ldg(beta + (c_t0 + lane) * HV + vh) : 0.0f;
-            const float* g = gm + ((int64_t) ch * HV + vh) * GCH;
-            gam = __ldg(g + lane);
-            gL = __ldg(g + GCH - 1);
-        }
+        bet = lane < n ? __ldg(beta + (c_t0 + lane) * HV + vh) : 0.0f;
+        const float* g = gm + ((int64_t) ch * HV + vh) * GCH;
+        gam = __ldg(g + lane);
+        gL = __ldg(g + GCH - 1);
     };
     auto store_sc = [&](int b, float bet, float gam, float gL) {
-        if (warp == 0) {
-            sc[b * GCH + lane] = make_float4(bet, expf(gam), expf(gL - gam), gam);
-            if (lane == 0) seL[b] = expf(gL);
-        }
+        sc[b * GCH + lane] = make_float4(bet, expf(gam), expf(gL - gam), gam);
+        if (lane == 0) seL[b] = expf(gL);
     };
+    if constexpr (STAGERS) {
+        if (warp >= GTC_CW) {   // the stager warps: a chunk into its buffer, a chunk ahead of the consumers
+            const int stid = tid - GTC_CW * 32;
+            for (int ch = 0; ch < nch; ++ch) {
+                const int b = ch & 1;
+                const int64_t c_t0 = t0 + (int64_t) ch * GCH;
+                const int n = (int) min((int64_t) GCH, T - c_t0);
+                if (ch >= 2) gtc_bar_sync(BAR_EMPTY + b, NT);   // the consumers finished chunk ch - 2 (this buffer)
+                constexpr int KQ4 = 2 * GCH * S / 4 / NS, V4 = GCH * S / 4 / NS, TP4 = GCH * GCH / 4 / NS;
+                float4 kq[KQ4];
+#pragma unroll
+                for (int m = 0; m < KQ4; ++m) kq[m] = load_kq4(stid + NS * m, c_t0, n);
+#pragma unroll
+                for (int m = 0; m < V4; ++m) stage_v4(b, stid + NS * m, c_t0, n);
+                gdn_cp_commit();
+                float4 t4[TP4], p4[TP4];
+#pragma unroll
+                for (int m = 0; m < TP4; ++m) load_tp4(ch, stid + NS * m, t4[m], p4[m]);
+                float bet = 0.0f, gam = 0.0f, gL = 0.0f;
+                if (stid < 32) load_sc(ch, c_t0, n, bet, gam, gL);
+#pragma unroll
+                for (int m = 0; m < KQ4; ++m) store_kq4(b, stid + NS * m, kq[m]);
+#pragma unroll
+                for (int m = 0; m < TP4; ++m) store_tp4(b, stid + NS * m, t4[m], p4[m]);
+                if (stid < 32) store_sc(b, bet, gam, gL);
+                gdn_cp_wait_all();
+                __threadfence_block();
+                gtc_bar_arrive(BAR_FULL + b, NT);   // chunk ch landed
+            }
+            return;
+        }
+    }
+    const int c0 = 16 * warp;   // the warp's value columns c0 + gid and c0 + gid + 8
     // the state slice as S^T fragments: tile j = rows 8j..8j+7; s[j][0] = S[8j + 2tig][c0 + gid], [1] the row after,
     // [2] column + 8, [3] both (64 scalar loads a lane, 32-B runs, once a launch)
     float s[16][4];
@@ -387,39 +427,48 @@ __global__ void __launch_bounds__(GTC_CW * 32, 1) gdn_tc_scan_kernel(float* __re
         const float* p = state + (size_t) (8 * j + 2 * tig) * rs + (size_t) vh * S + c0 + gid;
         s[j][0] = p[0]; s[j][1] = p[rs]; s[j][2] = p[8]; s[j][3] = p[rs + 8];
     }
-    {   // chunk 0 into buffer 0
+    constexpr int KQ4 = STAGERS ? 1 : 2 * GCH * S / 4 / NT, V4 = STAGERS ? 1 : GCH * S / 4 / NT;   // v0's pieces a thread
+    if constexpr (!STAGERS) {   // chunk 0 into buffer 0
         const int n0 = (int) min((int64_t) GCH, T - t0);
         float4 kq[KQ4], t4, p4;
         float bet = 0.0f, gam = 0.0f, gL = 0.0f;
-        load_kq(t0, n0, kq);
-        load_tp(0, t4, p4);
-        load_sc(0, t0, n0, bet, gam, gL);
-        stage_v(0, t0, n0);
+#pragma unroll
+        for (int m = 0; m < KQ4; ++m) kq[m] = load_kq4(tid + NT * m, t0, n0);
+        load_tp4(0, tid, t4, p4);
+        if (warp == 0) load_sc(0, t0, n0, bet, gam, gL);
+#pragma unroll
+        for (int m = 0; m < V4; ++m) stage_v4(0, tid + NT * m, t0, n0);
         gdn_cp_commit();
-        store_kq(0, kq);
-        store_tp(0, t4, p4);
-        store_sc(0, bet, gam, gL);
+#pragma unroll
+        for (int m = 0; m < KQ4; ++m) store_kq4(0, tid + NT * m, kq[m]);
+        store_tp4(0, tid, t4, p4);
+        if (warp == 0) store_sc(0, bet, gam, gL);
         gdn_cp_wait_all();
     }
     const float out_scale = rsqrtf((float) S);
     for (int ch = 0; ch < nch; ++ch) {
-        __syncthreads();   // chunk ch's buffer complete (every thread's cp.async waited); every read of the other one done
         const int b = ch & 1;
         const int64_t c_t0 = t0 + (int64_t) ch * GCH;
         const int n = (int) min((int64_t) GCH, T - c_t0);
         const bool more = ch + 1 < nch;
         const int64_t n_t0 = c_t0 + GCH;
         const int nn = more ? (int) min((int64_t) GCH, T - n_t0) : 0;
-        if (more) {   // the next chunk's v into the other buffer (chunk ch - 1 finished reading it before the barrier);
-                      // the k and q rows and T / P of the chunk after next into L2 (its k / q rows: 32 x 2 x 512 B)
-            stage_v(b ^ 1, n_t0, nn);
-            gdn_cp_commit();
-            const int64_t f_t0 = n_t0 + GCH;
-            const int t = tid >> 3, l = tid & 7;
-            if (f_t0 + t < T) gdn_pf_l2(h + (f_t0 + t) * C + (l < 4 ? HK * S : 0) + qhd * S + 32 * (l & 3));
-            if (ch + 2 < nch && tid < GCH) {
-                gdn_pf_l2(tm + (((int64_t) (ch + 2) * HV + vh) * GCH + tid) * GCH);
-                gdn_pf_l2(pm + (((int64_t) (ch + 2) * HV + vh) * GCH + tid) * GCH);
+        if constexpr (STAGERS) {
+            gtc_bar_sync(BAR_FULL + b, NT);   // chunk ch landed (the stagers arrived)
+        } else {
+            __syncthreads();   // chunk ch's buffer complete (every thread's cp.async waited); every read of the other one done
+            if (more) {   // the next chunk's v into the other buffer (chunk ch - 1 finished reading it before the barrier);
+                          // the k and q rows and T / P of the chunk after next into L2 (its k / q rows: 32 x 2 x 512 B)
+#pragma unroll
+                for (int m = 0; m < V4; ++m) stage_v4(b ^ 1, tid + NT * m, n_t0, nn);
+                gdn_cp_commit();
+                const int64_t f_t0 = n_t0 + GCH;
+                const int t = tid >> 3, l = tid & 7;
+                if (f_t0 + t < T) gdn_pf_l2(h + (f_t0 + t) * C + (l < 4 ? HK * S : 0) + qhd * S + 32 * (l & 3));
+                if (ch + 2 < nch && tid < GCH) {
+                    gdn_pf_l2(tm + (((int64_t) (ch + 2) * HV + vh) * GCH + tid) * GCH);
+                    gdn_pf_l2(pm + (((int64_t) (ch + 2) * HV + vh) * GCH + tid) * GCH);
+                }
             }
         }
         const uint16_t* bkh = kh + b * GCH * GTC_KP;
@@ -498,17 +547,23 @@ __global__ void __launch_bounds__(GTC_CW * 32, 1) gdn_tc_scan_kernel(float* __re
         for (int j = 0; j < 16; ++j)
 #pragma unroll
             for (int q = 0; q < 4; ++q) s[j][q] *= sOi;
-        if (more) {   // the next chunk's k, q, T, P and scalars into the other buffer
-            float4 kq[KQ4], t4, p4;
-            float bet = 0.0f, gam = 0.0f, gL = 0.0f;
-            load_kq(n_t0, nn, kq);
-            load_tp(ch + 1, t4, p4);
-            load_sc(ch + 1, n_t0, nn, bet, gam, gL);
-            store_kq(b ^ 1, kq);
-            store_tp(b ^ 1, t4, p4);
-            store_sc(b ^ 1, bet, gam, gL);
+        if constexpr (STAGERS) {
+            gtc_bar_arrive(BAR_EMPTY + b, NT);   // every read of this buffer by this warp is done
+        } else {
+            if (more) {   // the next chunk's k, q, T, P and scalars into the other buffer
+                float4 kq[KQ4], t4, p4;
+                float bet = 0.0f, gam = 0.0f, gL = 0.0f;
+#pragma unroll
+                for (int m = 0; m < KQ4; ++m) kq[m] = load_kq4(tid + NT * m, n_t0, nn);
+                load_tp4(ch + 1, tid, t4, p4);
+                if (warp == 0) load_sc(ch + 1, n_t0, nn, bet, gam, gL);
+#pragma unroll
+                for (int m = 0; m < KQ4; ++m) store_kq4(b ^ 1, tid + NT * m, kq[m]);
+                store_tp4(b ^ 1, tid, t4, p4);
+                if (warp == 0) store_sc(b ^ 1, bet, gam, gL);
+            }
+            gdn_cp_wait_all();   // this thread's v copies for the next chunk; the barrier at the top publishes them
         }
-        gdn_cp_wait_all();   // this thread's v copies for the next chunk; the barrier at the top publishes them
     }
 #pragma unroll
     for (int j = 0; j < 16; ++j) {

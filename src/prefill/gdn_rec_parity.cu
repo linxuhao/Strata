@@ -596,8 +596,9 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
 // src/prefill/kernels.cu's tensor-core scan (STRATA_GDN_TC=1): the same text, included there too
 #include "gdn_tc.cuh"
 // src/prefill/kernels.cu's gdn_rec_tc, copied as it is there (with the raw device attributes, as gdn_rec_chunked above)
-cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
-                       cudaStream_t s) {
+template <bool STAGERS>
+cudaError_t gdn_rec_tc_v(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                         cudaStream_t s) {
     if (T <= 0) return cudaSuccess;
     {
         int dev = 0, major = 0, sms = 0, smem = 0;
@@ -615,22 +616,27 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
     const int nb = (int) ((std::min<int64_t>(GSB, T) + GCH - 1) / GCH);
     const size_t tsz = (size_t) nb * HV * GCH * GCH;
     float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
+    constexpr int NT = (GTC_CW + (STAGERS ? 2 : 0)) * 32;
     {   // once a device
         static bool attrs[64] = {};
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev >= 0 && dev < 64 && !attrs[dev]) {
             cudaFuncSetAttribute(gdn_chunk_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kChunkPrepSmem);
-            cudaFuncSetAttribute(gdn_tc_scan_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
+            cudaFuncSetAttribute(gdn_tc_scan_kernel<false, STAGERS>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
             attrs[dev] = true;
         }
     }
     for (int64_t t0 = 0; t0 < T; t0 += GSB) {
         const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
         gdn_chunk_prep_kernel<<<dim3((unsigned) nch, HK), 256, kChunkPrepSmem, s>>>(h, gate, beta, tm, pm, gm, t0, T);
-        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, beta, tm, pm, gm, y, t0, nch, T);
+        gdn_tc_scan_kernel<false, STAGERS><<<HV, NT, kTcScanSmem<false>, s>>>(state, h, beta, tm, pm, gm, y, t0, nch, T);
     }
     return cudaSuccess;
+}
+cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                       cudaStream_t s) {
+    return gdn_rec_tc_v<true>(state, h, gate, beta, y, T, s);
 }
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
@@ -959,9 +965,10 @@ int check_chunked(int64_t T, uint64_t seed) {
     return check_variant(in, "chunked (STRATA_GDN_CHUNKED)", gdn_rec_chunked, "sm_80+, 128 SMs, 93.7 KB a block");
 }
 constexpr const char* kTcNeeds = "sm_80+, 48 SMs, 121 KB a block";
-int check_tc(int64_t T, uint64_t seed) {
+int check_tc(int64_t T, uint64_t seed) {   // the stager form (gdn_rec_tc) and v0 on the same inputs
     Inputs in(T, seed);
-    return check_variant(in, "tc (STRATA_GDN_TC=1)", gdn_rec_tc, kTcNeeds);
+    return check_variant(in, "tc (STRATA_GDN_TC=1)", gdn_rec_tc, kTcNeeds) +
+           check_variant(in, "tc v0 (cooperative staging)", gdn_rec_tc_v<false>, kTcNeeds);
 }
 // the tensor-core scan on the stress inputs (Inputs): its f16 range handling has a case for each
 int check_tc_stress(int64_t T, uint64_t seed) {
@@ -1303,15 +1310,16 @@ void bench(int64_t T) {
             });
             if (i >= warm) t_kc[v].push_back(ms);
         }
-    std::vector<float> t_tc[2];   // gdn_rec_kh_kernel and the tensor-core scan, alternating
+    std::vector<float> t_tc[3];   // gdn_rec_kh_kernel, the tensor-core scan (stager warps) and its v0, alternating
     const bool can_tc = gdn_rec_tc(state, in.h, in.gate, in.beta, oc, in.T, 0) == cudaSuccess &&
                         cudaDeviceSynchronize() == cudaSuccess;
     for (int i = 0; can_tc && i < warm + rounds; ++i)
-        for (int j = 0; j < 2; ++j) {
-            const int v = (i + j) % 2;
+        for (int j = 0; j < 3; ++j) {
+            const int v = (i + j) % 3;
             const float ms = timed([&] {
                 if (v == 0) gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG)>>>(state, in.h, in.gate, in.beta, oc, in.T);
-                else ck(gdn_rec_tc(state, in.h, in.gate, in.beta, oc, in.T, 0), "tc");
+                else if (v == 1) ck(gdn_rec_tc(state, in.h, in.gate, in.beta, oc, in.T, 0), "tc");
+                else ck(gdn_rec_tc_v<false>(state, in.h, in.gate, in.beta, oc, in.T, 0), "tc v0");
             });
             if (i >= warm) t_tc[v].push_back(ms);
         }
@@ -1327,9 +1335,11 @@ void bench(int64_t T) {
                     kc, 1000.0f * kc / (float) T, kh / kc);
     }
     if (can_tc) {
-        const float kh = median(t_tc[0]), tc = median(t_tc[1]);
+        const float kh = median(t_tc[0]), tc = median(t_tc[1]), tc0 = median(t_tc[2]);
         std::printf("    recurrence, tensor-core chunked (STRATA_GDN_TC=1) %8.2f ms  (%.3f us per token)  %.2fx gdn_rec_kh_kernel\n",
                     tc, 1000.0f * tc / (float) T, kh / tc);
+        std::printf("    the same, v0 (256 threads, cooperative staging)  %8.2f ms  (%.3f us per token)  %.2fx gdn_rec_kh_kernel\n",
+                    tc0, 1000.0f * tc0 / (float) T, kh / tc0);
     }
     std::printf("    output norm, before (FP32 and FP16 store)      %8.2f ms\n", n0);
     std::printf("    output norm, FP16 store only                   %8.2f ms  %.2fx\n", n1, n0 / n1);

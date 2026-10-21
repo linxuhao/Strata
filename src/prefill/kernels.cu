@@ -1971,6 +1971,32 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[t * HV * S + head * S + col]);
     y16[(size_t) t * ld16 + (size_t) head * S + col] = hf(v);   // (the FP32 normalized value is not stored: nothing reads it)
 }
+#if !defined(__HIPCC__)
+// STRATA_GDN_OUT_NORM_LOOP=1: gdn_out_norm_kernel's body over a grid-stride walk of the T * HV (token, head) rows -
+// the CUDA instance of the AMD kernel above (minus its FP32 y store, which nothing reads here).  A block per row is
+// T * 48 one-row blocks (156K at 3K tokens: the launch rate and the per-row ramp cost ~30% of the bandwidth).  The
+// row body is a verbatim copy of gdn_out_norm_kernel's: the same expressions in the same order, so nvcc's
+// contraction (-fmad=true) makes the same choices in both - the same bits.
+__global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                              float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
+                                                              int64_t rows, int64_t ld16) {
+    __shared__ float wsum[4];
+    const int col = threadIdx.x;
+    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const int64_t t = row / HV;
+        const int head = (int) (row % HV);
+        const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+        const float oc = y[at];
+        float sp = warp_sum(oc * oc);
+        __syncthreads();                               // the previous row's wsum reads are done
+        if ((col & 31) == 0) wsum[col >> 5] = sp;
+        __syncthreads();
+        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+        const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[t * HV * S + head * S + col]);
+        y16[(size_t) t * ld16 + (size_t) head * S + col] = hf(v);
+    }
+}
+#endif
 
 // ---------------------------------------------------------------- MoE
 template <int REG>
@@ -2718,6 +2744,14 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
             gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+#if !defined(__HIPCC__)
+        // STRATA_GDN_OUT_NORM_LOOP=1 (opt-in): the norm as a grid-stride walk of the T * HV rows (same bits)
+        static const bool norm_loop = [] { const char* v = std::getenv("STRATA_GDN_OUT_NORM_LOOP"); return v != nullptr && std::atoi(v) != 0; }();
+        if (norm_loop)
+            gdn_out_norm_loop_kernel<<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
+                z, gamma, eps, y, y16, T * HV, ld16);
+        else
+#endif
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     }
     check("gdn_recurrence");

@@ -460,6 +460,49 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         bad += qbad;
         cudaFree(d_q); cudaFree(d_ref); cudaFree(d_cnt);
     }
+    // plan-decode step 5: the reads of 1..6 tokens (STRATA_HC_FUSED=1 takes the fused half kernel there; the 8-token read
+    // above takes the default kernels whatever the switch), direct and from a captured graph, against the single-token
+    // calls bit for bit (the fused kernel's lo / rs / inject / mixed / R are the default read's, so the tolerance is zero)
+    {
+        int sbad = 0;
+        auto poison = [&]() {
+            check(cudaMemsetAsync(d_r_out, 0xff, r.size() * sizeof(float), stream), "small poison R_out");
+            check(cudaMemsetAsync(d_lo, 0xff, (size_t) T * LR * sizeof(float), stream), "small poison lo");
+            check(cudaMemsetAsync(d_rs, 0xff, (size_t) T * HC * sizeof(float), stream), "small poison rs");
+            check(cudaMemsetAsync(d_inj_out, 0xff, (size_t) T * HC * sizeof(float), stream), "small poison inject");
+            check(cudaMemsetAsync(d_mixed, 0xff, (size_t) T * N * sizeof(float), stream), "small poison mixed");
+        };
+        for (int tt = 1; tt <= 6; ++tt) {
+            for (size_t i = 0; i < r.size(); ++i) r[i] = 0.9f * r[i] + 0.003f * (float) (i % 13);
+            check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "small R");
+            poison();
+            fused_gr_read_multi(args.data(), tt, d_xn, stream);
+            check(cudaStreamSynchronize(stream), "small direct sync");
+            const Snapshot direct = snapshot();
+            poison();
+            cudaGraph_t sg = nullptr;
+            cudaGraphExec_t sx = nullptr;
+            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "small graph begin");
+            fused_gr_read_multi(args.data(), tt, d_xn, stream);
+            check(cudaStreamEndCapture(stream, &sg), "small graph end");
+            check(cudaGraphInstantiate(&sx, sg, nullptr, nullptr, 0), "small graph instantiate");
+            check(cudaGraphLaunch(sx, stream), "small graph replay 1");
+            check(cudaGraphLaunch(sx, stream), "small graph replay 2");
+            check(cudaStreamSynchronize(stream), "small graph sync");
+            const Snapshot captured2 = snapshot();
+            cudaGraphExecDestroy(sx);
+            cudaGraphDestroy(sg);
+            poison();
+            for (int t = 0; t < tt; ++t) fused_gr_read(args[t], stream);
+            check(cudaStreamSynchronize(stream), "small single sync");
+            const Snapshot ref = snapshot();
+            if (!same(direct, ref)) { std::printf("  fused GR multi T=%d differs from single-token calls\n", tt); ++sbad; }
+            if (!same(captured2, ref)) { std::printf("  fused GR multi T=%d captured graph (replayed twice) differs from single-token calls\n", tt); ++sbad; }
+        }
+        if (fused_gr_half_aborted()) { std::printf("  fused GR half kernel (STRATA_HC_FUSED) aborted at a barrier\n"); ++sbad; }
+        std::printf("  fused GR multi T 1..6 direct and captured vs single-token calls: %s\n", sbad ? "FAIL" : "pass");
+        bad += sbad;
+    }
     std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
                 bad == 0 ? "pass" : "FAIL");
     check(cudaGraphExecDestroy(graph_exec), "multi graph exec destroy");

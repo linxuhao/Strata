@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <mutex>
 #include <type_traits>
 #include <cmath>
 #include <cstdio>
@@ -854,12 +855,11 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
 // thread's own sum of squares ascends in k; the warp sum, part[] sum and rsqrt are the kernel's), so rs and xn are
 // bitwise the same; what goes is the loop's one-iteration-at-a-time loads and the second pass that read xn back from
 // global memory (a write, a barrier, a read: two memory latencies).
-__global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) {
-    __shared__ float part[WARPS];
-    __shared__ float s_rs;
-    const FusedGrArgs& a = m.a[blockIdx.x];
-    const int c = blockIdx.y;
-    float* xn = m.xn + (size_t) blockIdx.x * D;
+// the kernel's body for (token k, stream c), one block of THREADS (`part`: WARPS floats, `s_rs`: one float of shared
+// memory); gr_half_kernel's norm blocks run it too (plan-decode step 5)
+__device__ __forceinline__ void norm_split_fast_body(const GrMulti& m, const int k, const int c, float* part, float* s_rs) {
+    const FusedGrArgs& a = m.a[k];
+    float* xn = m.xn + (size_t) k * D;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
     // the thread's float4 of stream c: i = 4 t + 1024 k in [c N, (c + 1) N), ascending k; N / 1024 = 2.5 -> at most 3
@@ -897,16 +897,21 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) 
     if (t == 0) {
         float s = 0.0f;
         for (int w = 0; w < WARPS; ++w) s += part[w];
-        s_rs = rsqrtf(s / (float) N + a.eps);
-        a.rs[c] = s_rs;
+        *s_rs = rsqrtf(s / (float) N + a.eps);
+        a.rs[c] = *s_rs;
     }
     __syncthreads();
-    const float rs = s_rs;
+    const float rs = *s_rs;
 #pragma unroll
     for (int j = 0; j < KS; ++j)
         if (ok[j])
             *reinterpret_cast<float4*>(xn + t * 4 + (k0 + j) * THREADS * 4) =
                 make_float4(r[j].x * rs, r[j].y * rs, r[j].z * rs, r[j].w * rs);
+}
+__global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    norm_split_fast_body(m, (int) blockIdx.x, (int) blockIdx.y, part, &s_rs);
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__)
@@ -1115,6 +1120,398 @@ __global__ void __launch_bounds__(THREADS5) gr_down_staged5_kernel(GrMulti m) {
         }
     }
 }
+
+// ============ plan-decode step 5 (hc-2; STRATA_HC_FUSED=1): the hyper-connection half as ONE kernel ============
+// gr_norm_split_fast + gr_down_staged + gr_up75 in one launch of 70 blocks x 256 threads (one per SM of the CMP 170HX:
+// the shared-memory footprint, 125-156 KB, allows no more), bitwise the three kernels: every row's dot products run
+// the same lane / chunk order, warp_sum and epilogue, the norm reduction is the split-fast kernel's body run by blocks
+// 0..4T-1, and the mean over the streams sums in the same order.  Only who computes what, and when, changes:
+//   phase 0: every block starts the cp.async of its up rows (4 streams x 37 columns = 148 rows, 94.7 KB) and its down
+//            warps' first two weight tiles; blocks b < 4 T run the norm for (token b / 4, stream b % 4) and bump
+//            norm_done; every block then waits for norm_done = 4 T (one acquire spin by thread 0)
+//   phase 1: warps 0-4 (0-3 from block 44 on: 44 x 5 + 26 x 4 = 324 = 320 down + 4 inject rows) run the staged down
+//            loop as gr_down_staged_kernel does, an eighth of the up rows riding in each tile's cp.async group; lo /
+//            inject to global
+//   grid barrier: an arrival counter and a generation word (the last arriver resets the counters) with a %globaltimer
+//            timeout that sets an abort word (device, and a mapped host word the verifier reads after the window)
+//   phase 2: lo staged from global; all 8 warps run gr_up75_kernel's per-row code on the smem up rows (row slots
+//            warp + 8 i in batches of 10 so the dots and xor trees interleave 10-wide; a clamped slot's result is
+//            discarded), then the epilogue one (row, token) pair per lane (lane k's sums transposed through shared
+//            memory), the mean over the streams as before.
+// T = 1..6 (T >= 7 takes the default read; both are bitwise the plain read).  The launch carries
+// cudaLaunchAttributeCooperative when this runtime accepts it inside stream capture (probed at init), so the 70
+// blocks are co-resident by contract; otherwise the footprint (one block per SM) and the timeout guard it.
+// MEASURED on the CMP 170HX (fused_gr_bench cold, T = 3): 37.3 us against 36.4 for the three kernels - no gain.  The
+// %globaltimer trace (STRATA_HC_FUSED_TRACE=1): norm + flag ~5 us, the down chain 17-18 us mean / 20.5 slowest block
+// (every block then waits for it at the barrier: ~5 us), the up dots 5 us, epilogue and mean ~1 us.  With one block of
+// 8 warps per SM every phase issues at ~10 cycles per instruction (ncu: 0.24 eligible warps per scheduler), so the
+// up projection from shared memory costs 5 us, not the 2 the design assumed, and the down chain does not shrink
+// (plan-decode R-A1).  Kept behind the switch, off by default.
+#if !defined(__HIPCC__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#define HCH_ARCH_OK 0   // the acquire / release loads and __nanosleep are sm_70+; the host offers the read on sm_80+ only
+#else
+#define HCH_ARCH_OK 1
+#endif
+namespace hch {
+constexpr int NB = 70;                                  // blocks: one per SM
+constexpr int ROWS = LR + HC;                           // 324 down + inject rows
+constexpr int NB5 = 44;                                 // blocks 0..43 take 5 rows, the rest 4
+static_assert(NB5 * 5 + (NB - NB5) * 4 == ROWS, "the down row map covers every row once");
+constexpr int ND = 37, NBIG = 40;                       // up columns a block: 40 x 37 + 30 x 36 = 2560
+static_assert(NBIG * ND + (NB - NBIG) * (ND - 1) == N, "the up column map covers every column once");
+constexpr int UPR = HC * ND;                            // 148 up rows a block at most
+constexpr int ROW_U4 = LR / 8;                          // 40 uint4 an up row
+constexpr size_t UP_BYTES = (size_t) UPR * ROW_U4 * sizeof(uint4);   // 94,720
+constexpr int SLOTS = (UPR + WARPS - 1) / WARPS;        // 19 row slots a warp
+constexpr int BATCH = 10, NBATCH = (SLOTS + BATCH - 1) / BATCH;   // the up rows in batches of 10 (the chains interleave 10-wide)
+constexpr int NWT = (BATCH + 3) / 4;                    // packed tail registers a batch (4 rows' tail chunks in one uint4)
+static_assert(LR / 8 - 32 == 8, "a row's tail is 8 chunks: lanes 8 i + j hold chunk 32 + j of row i");
+constexpr int W_ARR = 0, W_GEN = 32, W_NORM = 64, W_ABORT = 96, W_WORDS = 128;   // a 128-B line each
+static_assert(2 * H_TILE * sizeof(float) >= (size_t) (LR + HC * ND + 2 * HC + WARPS * SLOTS) * sizeof(float), "lo, g, rs / gate and the sums fit one token's staging");
+// stream c of up row slot rr (rr < HC nd): rr / nd without a division by the runtime nd
+__device__ __forceinline__ int stream_of(const int rr, const int nd) { return (rr >= nd) + (rr >= 2 * nd) + (rr >= 3 * nd); }
+struct Sync {
+    unsigned* bar;                   // the stream's barrier words (device)
+    unsigned* abort_host;            // the mapped host word (its device pointer), set with the device abort word
+    unsigned long long timeout_ns;   // a spin longer than this aborts the read
+    unsigned long long* trace;       // STRATA_HC_FUSED_TRACE=1 (the harnesses): %globaltimer per block at the phase ends, or null
+    int pf;                          // the down row's L2 prefetch: 0 none, 1 the whole row at the start, 2 paced (two tiles beyond the ring)
+};
+constexpr size_t smem_bytes(int T) { return UP_BYTES + (size_t) 2 * T * H_TILE * sizeof(float); }
+
+__device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
+    unsigned v = 0;
+#if HCH_ARCH_OK
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+#endif
+    return v;
+}
+__device__ __forceinline__ unsigned ld_relaxed(const unsigned* p) {
+    unsigned v = 0;
+#if HCH_ARCH_OK
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+#endif
+    return v;
+}
+__device__ __forceinline__ void st_relaxed(unsigned* p, unsigned v) {
+#if HCH_ARCH_OK
+    asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+#endif
+}
+__device__ __forceinline__ unsigned atom_add_acq_rel(unsigned* p, unsigned v) {
+    unsigned o = 0;
+#if HCH_ARCH_OK
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(o) : "l"(p), "r"(v) : "memory");
+#endif
+    return o;
+}
+__device__ __forceinline__ void red_release_add(unsigned* p, unsigned v) {
+#if HCH_ARCH_OK
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+#endif
+}
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+__device__ __forceinline__ unsigned long long gtimer() {
+    unsigned long long t = 0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+// thread 0 only: spin until `done()`; false when the wait timed out (then both abort words are set) or another block
+// aborted.  The abort word stays set until the host clears the words: every later launch on these words aborts at once.
+template <class F>
+__device__ __forceinline__ bool spin_until(F done, const Sync& s) {
+    const unsigned long long t0 = gtimer();
+    while (!done()) {
+        if (ld_relaxed(s.bar + W_ABORT) != 0u) return false;
+        if (gtimer() - t0 > s.timeout_ns) {
+            st_relaxed(s.bar + W_ABORT, 1u);
+            *(volatile unsigned*) s.abort_host = 1u;
+            __threadfence_system();
+            return false;
+        }
+#if HCH_ARCH_OK
+        __nanosleep(128);
+#endif
+    }
+    return true;
+}
+// all threads of every block; false = aborted (every block leaves the kernel, the outputs stay partial)
+__device__ __forceinline__ bool grid_barrier(const Sync& s, int* s_abort) {
+    __syncthreads();                                    // every warp's lo / inject stores are issued
+    if (threadIdx.x == 0) {
+        int ab = 0;
+        const unsigned gen0 = ld_relaxed(s.bar + W_GEN);
+        __threadfence();                                // the block's stores reach L2 before the arrival counts
+        const unsigned arrived = atom_add_acq_rel(s.bar + W_ARR, 1u);
+        if (arrived == NB - 1) {                        // the last arriver: counters back to zero, then the generation
+            st_relaxed(s.bar + W_ARR, 0u);
+            st_relaxed(s.bar + W_NORM, 0u);
+            __threadfence();
+            red_release_add(s.bar + W_GEN, 1u);
+        } else {
+            ab = spin_until([&] { return ld_acquire(s.bar + W_GEN) != gen0; }, s) ? 0 : 1;
+        }
+        if (ld_relaxed(s.bar + W_ABORT) != 0u) ab = 1;
+        *s_abort = ab;
+    }
+    __syncthreads();
+    __threadfence();
+    return *s_abort == 0;
+}
+
+template <int T>
+__global__ void __launch_bounds__(THREADS, 1) gr_half_kernel(GrMulti m, Sync s) {
+#if HCH_ARCH_OK
+    extern __shared__ __align__(16) uint4 hdyn[];
+    uint4* wup = hdyn;                                                          // [HC nd][40]: the block's up rows
+    float4* hbuf = reinterpret_cast<float4*>(hdyn + (size_t) UPR * ROW_U4);    // 2 x [T][2][160]: the down tiles; lo / g after the barrier
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    __shared__ int s_abort;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, b = blockIdx.x;
+    auto stamp = [&](const int i) { if (s.trace != nullptr && t == 0) s.trace[b * 8 + i] = gtimer(); };
+    stamp(0);
+    const int nd = b < NBIG ? ND : ND - 1;
+    const int d0 = b < NBIG ? b * ND : NBIG * ND + (b - NBIG) * (ND - 1);
+    const int nw = b < NB5 ? 5 : 4;
+    const int r0 = b < NB5 ? b * 5 : NB5 * 5 + (b - NB5) * 4;
+    const int row = r0 + warp;                                                  // < LR: a down row; LR..LR+3: inject row row - LR
+    const bool inject_row = row >= LR;
+    const bool active = warp < nw && !(inject_row && m.a[0].w_inject == nullptr);
+    const uint16_t* wrow = !active ? m.a[0].w_down
+                           : inject_row ? m.a[0].w_inject + (size_t) (row - LR) * D : m.a[0].w_down + (size_t) row * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    // --- phase 0: the up rows in 8 chunks (chunk h rides with tile h's cp.async group), the first weight tiles, the norm
+    const int n_cp = nd * HC * ROW_U4, cp_chunk = (n_cp + 7) / 8;
+    auto up_chunk = [&](const int ch) {   // by the warps without a down row: off the down warps' chains
+        if (warp < nw) return;
+        const int i1 = (ch + 1) * cp_chunk < n_cp ? (ch + 1) * cp_chunk : n_cp;
+        for (int i = ch * cp_chunk + (t - nw * 32); i < i1; i += (WARPS - nw) * 32) {
+            const int r = i / ROW_U4, u = i - r * ROW_U4, c = stream_of(r, nd), j = r - c * nd;
+            cp_async16(wup + (size_t) r * ROW_U4 + u,
+                       reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) (c * N + d0 + j) * LR) + u);
+        }
+    };
+    uint4 wv[HQ], w1[HQ], w2[HQ];                   // tiles h, h + 1, h + 2 of the warp's row: three DRAM latencies in flight
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) w1[q] = __ldg(w4 + (H_TILE / 8) + lane + 32 * q);
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) w2[q] = __ldg(w4 + 2 * (H_TILE / 8) + lane + 32 * q);
+        // the rest of the row into L2 (the ring's loads then hit L2: the inject block, whose rows are L2-hot, runs its
+        // chain in 9 us against 16 for a DRAM-cold row) - the whole row at once (pf 1) or two tiles beyond the ring (pf 2)
+        if (s.pf == 1) {
+#pragma unroll
+            for (int h = 3; h < N_HTILES; ++h) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) prefetch_l2(w4 + h * (H_TILE / 8) + lane + 32 * q);
+            }
+        } else if (s.pf == 2) {
+#pragma unroll
+            for (int h = 3; h < 5; ++h) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) prefetch_l2(w4 + h * (H_TILE / 8) + lane + 32 * q);
+            }
+        }
+    }
+    if (b < HC * T) {                                                           // the norm of (token b / 4, stream b % 4)
+        norm_split_fast_body(m, b / HC, b - (b / HC) * HC, part, &s_rs);
+        __syncthreads();
+        if (t == 0) {
+            __threadfence();
+            red_release_add(s.bar + W_NORM, 1u);
+        }
+    }
+    if (t == 0) s_abort = spin_until([&] { return ld_acquire(s.bar + W_NORM) >= (unsigned) (HC * T); }, s) ? 0 : 1;
+    __syncthreads();
+    if (s_abort) return;
+    __threadfence();
+    stamp(1);
+    // --- phase 1: gr_down_staged_kernel's loop; the up-row chunks ride in the tiles' cp.async groups (chunk h with tile h,
+    // waited two iterations later)
+    float acc[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+    stage_htile(m, T, 0, hbuf, t);
+    up_chunk(0);
+    cp_async_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t);
+    up_chunk(1);
+    cp_async_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
+        else cp_async_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                    acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                }
+            }
+        }
+        __syncthreads();                                // every warp is done with buffer h & 1
+        if (h + 2 < N_HTILES) {
+            stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
+            up_chunk(h + 2);
+        }
+        cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) { wv[q] = w1[q]; w1[q] = w2[q]; }
+            if (h + 3 < N_HTILES) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) w2[q] = __ldg(w4 + (h + 3) * (H_TILE / 8) + lane + 32 * q);
+            }
+            if (s.pf == 2 && h + 5 < N_HTILES) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) prefetch_l2(w4 + (h + 5) * (H_TILE / 8) + lane + 32 * q);
+            }
+        }
+    }
+    if (active) {
+        float sum[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) sum[k] = warp_sum(acc[k]);
+        // lane k writes token k (every lane holds every sum after the xor reduction)
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            if (lane != k) continue;
+            if (inject_row) {
+                m.a[k].inject_out[row - LR] = sum[k];
+            } else {
+                const float x = sum[k] / (float) HC;
+                m.a[k].lo[row] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+    stamp(2);
+    // the up epilogue's inputs (gr_up75_kernel loads them after its dots): one (row slot, token) pair per lane and step,
+    // issued here so they land during the barrier wait
+    const int rows = HC * nd;
+    constexpr int NPAIR = (SLOTS * T + 31) / 32;
+    float rv[NPAIR], wn[NPAIR], bo[NPAIR];
+#pragma unroll
+    for (int r = 0; r < NPAIR; ++r) {
+        const int pi = lane + 32 * r, i = pi / T, k = pi - i * T;
+        const int rr = warp + WARPS * i;
+        const int rc = rr < rows ? rr : 0;
+        const int c = stream_of(rc, nd), j = rc - c * nd, rowg = c * N + d0 + j;
+        const FusedGrArgs& a = m.a[pi < SLOTS * T ? k : 0];
+        rv[r] = a.R[rowg];
+        wn[r] = a.w_norm[rowg];
+        bo[r] = a.apply ? a.bo_prev[d0 + j] : 0.0f;
+    }
+    // --- the grid barrier: every lo / inject value is in L2 before any block stages lo
+    if (!grid_barrier(s, &s_abort)) return;
+    stamp(3);
+    // --- phase 2: gr_up75_kernel's rows on the smem up rows (lo, g, rs / gate, the sums carved from the dead staging buffer)
+    float* lo = reinterpret_cast<float*>(hbuf);                                 // [T][LR]
+    float* g = lo + T * LR;                                                     // [T][HC][ND]
+    float* rsg = g + T * HC * ND;                                               // [T][HC] rs (the norm blocks')
+    float* gwg = rsg + T * HC;                                                  // [T][HC] 2 sigmoid(inj_prev / HC), or 0
+    float* ms = gwg + T * HC;                                                   // [WARPS][T][SLOTS]: the sums, lane k's transposed
+    for (int i = t; i < T * LR; i += THREADS) lo[i] = __ldcg(m.a[i / LR].lo + (i - (i / LR) * LR));
+    if (t < T * HC) {
+        const FusedGrArgs& a = m.a[t / HC];
+        rsg[t] = __ldcg(a.rs + (t - (t / HC) * HC));
+        gwg[t] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[t - (t / HC) * HC] / (float) HC) : 0.0f;
+    }
+    __syncthreads();
+    const int tj = lane & 7, ti = lane >> 3;       // tail: chunk 32 + tj of batch row 4 q + ti
+    float mine[NBATCH * BATCH];
+#pragma unroll
+    for (int i = 0; i < NBATCH * BATCH; ++i) mine[i] = 0.0f;
+#pragma unroll
+    for (int bt = 0; bt < NBATCH; ++bt) {           // batches of BATCH rows: the dots and xor trees interleaved BATCH-wide
+        uint4 wa[BATCH], wt[NWT];
+#pragma unroll
+        for (int i = 0; i < BATCH; ++i) {
+            int rr = warp + WARPS * (bt * BATCH + i);
+            if (rr >= rows) rr = 0;                 // a clamped slot: computed on row 0, discarded
+            wa[i] = wup[(size_t) rr * ROW_U4 + lane];
+        }
+#pragma unroll
+        for (int q = 0; q < NWT; ++q) {             // lane 8 ti + tj holds chunk 32 + tj of batch row 4 q + ti
+            int rr = warp + WARPS * (bt * BATCH + 4 * q + ti);
+            if (4 * q + ti >= BATCH || rr >= rows) rr = 0;
+            wt[q] = wup[(size_t) rr * ROW_U4 + 32 + tj];
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float4* la = reinterpret_cast<const float4*>(lo + k * LR + lane * 8);
+            const float4* lb = reinterpret_cast<const float4*>(lo + k * LR + (32 + tj) * 8);
+            const float4 x0 = la[0], x1 = la[1], y0 = lb[0], y1 = lb[1];
+            float tb[NWT];
+#pragma unroll
+            for (int q = 0; q < NWT; ++q) tb[q] = dot8u(unpack8(wt[q]), y0, y1);
+            float p[BATCH];
+#pragma unroll
+            for (int i = 0; i < BATCH; ++i) {
+                const float b2 = __shfl_sync(0xffffffffu, tb[i / 4], (i % 4) * 8 + tj);
+                float a1 = dot8u(unpack8(wa[i]), x0, x1);
+                if (lane < 8) a1 += b2;
+                p[i] = a1;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+                for (int i = 0; i < BATCH; ++i) p[i] += __shfl_xor_sync(0xffffffffu, p[i], o);
+            }
+            if (lane == k) {
+#pragma unroll
+                for (int i = 0; i < BATCH; ++i) mine[bt * BATCH + i] = p[i];
+            }
+        }
+    }
+    stamp(5);
+    // the epilogue (gr_up75_kernel's per row and token) by every lane: lane k's sums transposed through shared memory
+    if (lane < T) {
+#pragma unroll
+        for (int i = 0; i < SLOTS; ++i) ms[(warp * T + lane) * SLOTS + i] = mine[i];
+    }
+    __syncwarp();
+#pragma unroll
+    for (int r = 0; r < NPAIR; ++r) {
+        const int pi = lane + 32 * r, i = pi / T, k = pi - i * T;
+        const int rr = warp + WARPS * i;
+        if (pi >= SLOTS * T || rr >= rows) continue;
+        const int c = stream_of(rr, nd), j = rr - c * nd, rowg = c * N + d0 + j;
+        const FusedGrArgs& a = m.a[k];
+        float x0 = rv[r];
+        if (a.apply) {
+            x0 = fmaf(bo[r], gwg[k * HC + c], x0);
+            a.R_out[rowg] = x0;
+        }
+        const float x = x0 * wn[r] * rsg[k * HC + c];
+        g[(k * HC + c) * ND + j] = x * sigmoidf_(ms[(warp * T + k) * SLOTS + i]);
+    }
+    stamp(6);
+    __syncthreads();
+    for (int i = t; i < T * nd; i += THREADS) {
+        const int k = i / nd, col = i - k * nd;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[(k * HC + c) * ND + col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+    stamp(4);
+#else
+    (void) m; (void) s;
+#endif
+}
+}  // namespace hch
+#endif   // !__HIPCC__
 
 // the current device is Volta (sm_70): the fast norm/up is its default
 bool cur_dev_volta() {
@@ -2303,6 +2700,9 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
+namespace {
+bool half_dispatch(const GrMulti& m, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0);   // STRATA_HC_FUSED, below
+}  // namespace
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
@@ -2428,6 +2828,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         return false;   // the gfx906 STRATA_GR_SPLIT read: no q8_1 (the caller quantizes), like the v3 path above
     }
 #endif
+    // STRATA_HC_FUSED=1 (plan-decode step 5): the half as one kernel, bitwise the default read (T <= 6, bf16, no q8_1 image)
+    if (half_dispatch(m, st, stamp_buf, stamp_i0)) return false;
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
     launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
     const cudaError_t e = cudaGetLastError();
@@ -2684,6 +3086,402 @@ void fused_gr_check() {
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
 }
+
+// ---------------- STRATA_HC_FUSED=1 (plan-decode step 5): the host side of gr_half_kernel ----------------
+#if !defined(__HIPCC__)
+namespace {
+namespace hch {
+constexpr int kSlots = 8;   // streams that may carry the read (the verifier's, the drafter's, the harnesses')
+struct Slot {
+    cudaStream_t stream = nullptr;
+    unsigned* bar = nullptr;             // W_WORDS device words
+    volatile unsigned* abort_h = nullptr;   // the mapped host word the device sets on a timeout
+    unsigned* abort_d = nullptr;         // its device pointer
+};
+struct DevHalf {
+    bool tried = false, on = false, coop = false;
+    int max_t = 0;
+    unsigned* bar = nullptr;             // kSlots x W_WORDS
+    unsigned* abort_h = nullptr;         // mapped host, kSlots x 32 words
+    unsigned* abort_d = nullptr;
+    Slot slot[kSlots];
+    int n_slots = 0;
+    std::mutex mu;
+};
+DevHalf g_half[64];
+// a barrier never waits this long in a working run (another tenant's time slice pauses all 70 blocks together); the
+// init check uses the shorter one
+constexpr unsigned long long kRunNs = 2000000000ULL, kCheckNs = 500000000ULL;
+bool env_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_FUSED"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+// STRATA_HC_FUSED_PF: the down row's L2 prefetch (0 none, 1 the whole row at the start, 2 paced; default 0: fused_gr_bench
+// cold T = 3: 37.3 / 40.2 / 37.6-39.2 us - the prefetch burst only delays the loads it meant to hide)
+int pf_mode() {
+    static const int pf = [] { const char* v = std::getenv("STRATA_HC_FUSED_PF"); return v != nullptr ? std::atoi(v) : 0; }();
+    return pf;
+}
+void (*kernel_of(int T))(GrMulti, Sync) {
+    switch (T) {
+        case 1: return gr_half_kernel<1>;
+        case 2: return gr_half_kernel<2>;
+        case 3: return gr_half_kernel<3>;
+        case 4: return gr_half_kernel<4>;
+        case 5: return gr_half_kernel<5>;
+        default: return gr_half_kernel<6>;
+    }
+}
+cudaError_t launch(const GrMulti& m, const Sync& s, bool coop, cudaStream_t st) {
+    if (m.T < 1 || m.T > 6) return cudaErrorInvalidValue;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(NB);
+    cfg.blockDim = dim3(THREADS);
+    cfg.dynamicSmemBytes = smem_bytes(m.T);
+    cfg.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeCooperative;
+    at[0].val.cooperative = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = coop ? 1 : 0;
+    return cudaLaunchKernelEx(&cfg, kernel_of(m.T), m, s);
+}
+// the slot of `st`, assigned on first use (host state only: safe inside stream capture); null when all are taken
+Slot* slot_for(DevHalf& d, cudaStream_t st) {
+    std::lock_guard<std::mutex> lk(d.mu);
+    for (int i = 0; i < d.n_slots; ++i)
+        if (d.slot[i].stream == st) return &d.slot[i];
+    if (d.n_slots >= kSlots) return nullptr;
+    Slot& sl = d.slot[d.n_slots];
+    sl.stream = st;
+    sl.bar = d.bar + (size_t) d.n_slots * W_WORDS;
+    sl.abort_h = d.abort_h + (size_t) d.n_slots * 32;
+    sl.abort_d = d.abort_d + (size_t) d.n_slots * 32;
+    ++d.n_slots;
+    return &sl;
+}
+// The check: fused_gr_selftest's random data, T = 1..max_t x apply x inject, the fused read against this card's default
+// read BIT FOR BIT, direct and from a captured graph (which also tells whether the cooperative attribute is accepted
+// inside capture).  Returns false with `why`: any failure turns the read off.
+bool self_check(DevHalf& d, int max_t, std::string& why) {
+    constexpr int TM = 6;
+    std::mt19937 rng(20260930u);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
+    std::vector<float> h_norm(D), h_R((size_t) TM * D), h_bo((size_t) TM * N), h_ip((size_t) TM * HC);
+    for (auto& w : h_down) w = bf16_from_f32(0.02f * nd(rng));
+    for (auto& w : h_up) w = bf16_from_f32(0.05f * nd(rng));
+    for (auto& w : h_inj) w = bf16_from_f32(0.02f * nd(rng));
+    for (auto& w : h_norm) w = 1.0f + 0.1f * nd(rng);
+    for (auto& x : h_R) x = nd(rng);
+    for (auto& x : h_bo) x = 0.5f * nd(rng);
+    for (auto& x : h_ip) x = 2.0f * nd(rng);
+    const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);   // R_out, xn, lo, rs, inject, mixed
+    const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
+                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + 2 * n_set) * 4 + 32 * 256;
+    uint8_t* base = nullptr;
+    if (cudaMalloc((void**) &base, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        why = "no room for the check";
+        return false;
+    }
+    size_t off = 0;
+    auto take = [&](size_t b) { void* p = base + off; off += (b + 255) / 256 * 256; return p; };
+    uint16_t* d_down = (uint16_t*) take(h_down.size() * 2);
+    uint16_t* d_up = (uint16_t*) take(h_up.size() * 2);
+    uint16_t* d_inj = (uint16_t*) take(h_inj.size() * 2);
+    float* d_norm = (float*) take(h_norm.size() * 4);
+    float* d_R = (float*) take(h_R.size() * 4);
+    float* d_bo = (float*) take(h_bo.size() * 4);
+    float* d_ip = (float*) take(h_ip.size() * 4);
+    struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; } set[2];
+    for (Set& x : set) {
+        x.R_out = (float*) take((size_t) TM * D * 4); x.xn = (float*) take((size_t) TM * D * 4);
+        x.lo = (float*) take((size_t) TM * LR * 4); x.rs = (float*) take((size_t) TM * HC * 4);
+        x.inj = (float*) take((size_t) TM * HC * 4); x.mixed = (float*) take((size_t) TM * N * 4);
+    }
+    cudaStream_t st = nullptr;
+    bool ok = cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaMemcpyAsync(d_down, h_down.data(), h_down.size() * 2, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_up, h_up.data(), h_up.size() * 2, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_inj, h_inj.data(), h_inj.size() * 2, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_norm, h_norm.data(), h_norm.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_R, h_R.data(), h_R.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_bo, h_bo.data(), h_bo.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_ip, h_ip.data(), h_ip.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaStreamSynchronize(st) == cudaSuccess;
+    if (!ok) why = "setting up the check failed";
+    Slot* sl = ok ? slot_for(d, st) : nullptr;
+    std::vector<float> h1, h2;
+    auto same = [&](const float* a1, const float* a2, size_t n, const char* what, int T, int apply, int inject, const char* how) {
+        h1.resize(n);
+        h2.resize(n);
+        if (cudaMemcpy(h1.data(), a1, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(h2.data(), a2, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            why = "reading back the check failed";
+            return false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t u1, u2;
+            std::memcpy(&u1, &h1[i], 4);
+            std::memcpy(&u2, &h2[i], 4);
+            if (u1 != u2) {
+                char buf[224];
+                std::snprintf(buf, sizeof buf, "%s differs for %d token(s)%s%s (%s) at %zu (%08x, not %08x)", what, T,
+                              apply ? " with the pending write" : "", inject ? " with the inject rows" : "", how, i, u2, u1);
+                why = buf;
+                return false;
+            }
+        }
+        return true;
+    };
+    auto all_same = [&](int T, int apply, int inject, const char* how) {
+        return same(set[0].lo, set[1].lo, (size_t) T * LR, "lo", T, apply, inject, how) &&
+               same(set[0].rs, set[1].rs, (size_t) T * HC, "rs", T, apply, inject, how) &&
+               (!inject || same(set[0].inj, set[1].inj, (size_t) T * HC, "inject", T, apply, inject, how)) &&
+               same(set[0].mixed, set[1].mixed, (size_t) T * N, "mixed", T, apply, inject, how) &&
+               same(set[0].R_out, set[1].R_out, (size_t) T * D, "R", T, apply, inject, how);
+    };
+    auto args_of = [&](int v, int T, int apply, int inject, GrMulti& m) {
+        for (int k = 0; k < T; ++k) {
+            FusedGrArgs& x = m.a[k];
+            x = FusedGrArgs{};
+            x.R = d_R + (size_t) k * D; x.R_out = set[v].R_out + (size_t) k * D; x.apply = apply != 0;
+            x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
+            x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = inject ? d_inj : nullptr; x.eps = 1e-6f;
+            x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
+            x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
+        }
+        m.xn = set[v].xn;
+        m.T = T;
+    };
+    auto poison = [&]() {
+        for (int v = 0; v < 2 && ok; ++v) {
+            const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
+            ok = cudaMemsetAsync(set[v].R_out, 0xFF, span, st) == cudaSuccess;
+        }
+    };
+    auto aborted = [&]() { return sl != nullptr && *sl->abort_h != 0u; };
+    // the cooperative attribute: dropped at the first launch that refuses it; STRATA_HC_FUSED_COOP=0 never asks for it
+    static const bool coop_env = [] { const char* v = std::getenv("STRATA_HC_FUSED_COOP"); return v == nullptr || std::atoi(v) != 0; }();
+    bool coop = coop_env;
+    for (int apply = 0; apply < 2 && ok; ++apply)
+        for (int inject = 0; inject < 2 && ok; ++inject)
+            for (int T = 1; T <= max_t && ok; ++T) {
+                poison();
+                GrMulti m0, m1;
+                args_of(0, T, apply, inject, m0);
+                args_of(1, T, apply, inject, m1);
+                launch_multi(m0, fused_gr_variant(), st, nullptr, 0);
+                cudaError_t e = launch(m1, Sync{sl->bar, sl->abort_d, kCheckNs, nullptr, pf_mode()}, coop, st);
+                if (e != cudaSuccess && coop) {   // not offered as cooperative here: a plain launch, the timeout guards it
+                    cudaGetLastError();
+                    coop = false;
+                    e = launch(m1, Sync{sl->bar, sl->abort_d, kCheckNs, nullptr, pf_mode()}, coop, st);
+                }
+                if (e != cudaSuccess || cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
+                    why = std::string("a launch of the check failed (") + cudaGetErrorString(e) + ")";
+                    ok = false;
+                    break;
+                }
+                if (aborted()) {
+                    why = "a barrier of the check timed out (the 70 blocks were not all resident)";
+                    ok = false;
+                    break;
+                }
+                if (!all_same(T, apply, inject, "direct")) ok = false;
+            }
+    // the captured read (as the verifier's window graph carries it): replayed twice (the counters must be back to zero)
+    for (int attempt = 0; attempt < 2 && ok; ++attempt) {
+        const int T = max_t;
+        poison();
+        GrMulti m0, m1;
+        args_of(0, T, 1, 1, m0);
+        args_of(1, T, 1, 1, m1);
+        launch_multi(m0, fused_gr_variant(), st, nullptr, 0);
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        bool good = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        const cudaError_t le = good ? launch(m1, Sync{sl->bar, sl->abort_d, kCheckNs, nullptr, pf_mode()}, coop, st) : cudaErrorUnknown;
+        good = good && le == cudaSuccess;
+        if (cudaStreamEndCapture(st, &graph) != cudaSuccess) good = false;
+        if (good && cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) good = false;
+        if (good && (cudaGraphLaunch(exec, st) != cudaSuccess || cudaGraphLaunch(exec, st) != cudaSuccess)) good = false;
+        if (good && cudaStreamSynchronize(st) != cudaSuccess) good = false;
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        cudaGetLastError();
+        if (!good) {
+            if (coop && attempt == 0) { coop = false; continue; }   // refused inside capture: the plain launch
+            why = std::string("the captured read failed (") + cudaGetErrorString(le) + ")";
+            ok = false;
+            break;
+        }
+        if (aborted()) { why = "a barrier of the captured check timed out"; ok = false; break; }
+        if (!all_same(T, 1, 1, "captured")) ok = false;
+        break;
+    }
+    d.coop = coop;
+    // the slot was the check's: release it and the words
+    if (sl != nullptr) {
+        cudaMemset(d.bar, 0, (size_t) kSlots * W_WORDS * sizeof(unsigned));
+        std::memset(d.abort_h, 0, (size_t) kSlots * 32 * sizeof(unsigned));
+        cudaDeviceSynchronize();
+        d.n_slots = 0;
+    }
+    if (st != nullptr) cudaStreamDestroy(st);
+    cudaFree(base);
+    cudaGetLastError();
+    return ok;
+}
+// the per-device set-up and check, once (fused_gr_half_init, or the first read with the switch on outside capture)
+void init_dev(int dev) {
+    DevHalf& d = g_half[dev];
+    if (d.tried) return;
+    d.tried = true;
+    auto off = [&](const std::string& why) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_FUSED=1 is off here: %s\n", dev, why.c_str());
+    };
+    int sms = 0, major = 0, optin = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (strata::cc_major_of(major) < 8) { off("the kernel is written for sm_80 and later (cp.async, acquire / release)"); return; }
+    if (sms < NB) { off("fewer than " + std::to_string(NB) + " multiprocessors (" + std::to_string(sms) + ")"); return; }
+    int max_t = 0;
+    for (int T = 1; T <= 6; ++T) {
+        if (smem_bytes(T) + 256 > (size_t) optin) break;
+        auto k = kernel_of(T);
+        if (cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_bytes(T)) != cudaSuccess) break;
+        cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        int nb = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k, THREADS, smem_bytes(T)) != cudaSuccess || nb < 1) break;
+        max_t = T;
+    }
+    cudaGetLastError();
+    if (max_t == 0) { off("the shared-memory opt-in (" + std::to_string(optin) + " B) holds no token"); return; }
+    if (cudaMalloc((void**) &d.bar, (size_t) kSlots * W_WORDS * sizeof(unsigned)) != cudaSuccess ||
+        cudaMemset(d.bar, 0, (size_t) kSlots * W_WORDS * sizeof(unsigned)) != cudaSuccess ||
+        cudaHostAlloc((void**) &d.abort_h, (size_t) kSlots * 32 * sizeof(unsigned), cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &d.abort_d, d.abort_h, 0) != cudaSuccess) {
+        cudaGetLastError();
+        off("the barrier words could not be allocated");
+        return;
+    }
+    std::memset(d.abort_h, 0, (size_t) kSlots * 32 * sizeof(unsigned));
+    std::string why;
+    if (!self_check(d, max_t, why)) { off("the check against the default read failed: " + why); return; }
+    d.max_t = max_t;
+    d.on = true;
+    std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_FUSED=1: the hyper-connection read of up to %d tokens runs as one "
+                         "kernel (%d blocks on %d multiprocessors, %s launch, %zu KB of shared memory at 3 tokens); checked "
+                         "bit for bit against the default read, direct and captured\n", dev, max_t, NB, sms,
+                 d.coop ? "cooperative" : "plain (the cooperative attribute was refused: residency by footprint, a 2 s timeout)",
+                 smem_bytes(3) / 1024);
+}
+}  // namespace hch
+
+// fused_gr_read_multi's STRATA_HC_FUSED path (before the default read); false = not taken
+bool half_dispatch(const GrMulti& m, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    if (!hch::env_on()) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    hch::DevHalf& d = hch::g_half[dev];
+    if (!d.tried) {   // the harnesses: set up on the first read, never inside a capture
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+            cudaGetLastError();
+            return false;
+        }
+        hch::init_dev(dev);
+    }
+    if (!d.on || m.T > d.max_t) return false;
+    if (m.a[0].q8_mixed != nullptr || m.a[0].s_down != nullptr || m.a[0].s_up != nullptr) return false;   // STRATA_QFUSE / STRATA_HC_REQ8
+    hch::Slot* sl = hch::slot_for(d, st);
+    if (sl == nullptr) return false;
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    // STRATA_HC_FUSED_TRACE=1 (the harnesses, outside capture): every 97th read prints its phases from %globaltimer
+    static const bool trace_on = [] { const char* v = std::getenv("STRATA_HC_FUSED_TRACE"); return v != nullptr && std::atoi(v) != 0; }();
+    static unsigned long long* trace_d = nullptr;
+    static int trace_n = 0;
+    bool trace_now = false;
+    if (trace_on) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) {
+            if (trace_d == nullptr) cudaMalloc((void**) &trace_d, (size_t) hch::NB * 8 * sizeof(unsigned long long));
+            trace_now = trace_d != nullptr && (++trace_n % 97) == 0;
+        }
+        cudaGetLastError();
+    }
+    const cudaError_t e = hch::launch(m, hch::Sync{sl->bar, sl->abort_d, hch::kRunNs, trace_now ? trace_d : nullptr, hch::pf_mode()}, d.coop, st);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "fused_gr_read_multi: STRATA_HC_FUSED launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (trace_now) {
+        std::vector<unsigned long long> h((size_t) hch::NB * 8);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(h.data(), trace_d, h.size() * 8, cudaMemcpyDeviceToHost);
+        unsigned long long t0 = ~0ull, t4 = 0;
+        // 0 start, 1 after the norm flag, 2 after the down phase, 3 after the barrier, 5 after the up dots, 6 after the
+        // epilogue, 4 the end
+        const int order[7] = {0, 1, 2, 3, 5, 6, 4};
+        double ph[6] = {0, 0, 0, 0, 0, 0}, mx[6] = {0, 0, 0, 0, 0, 0};
+        for (int b = 0; b < hch::NB; ++b) {
+            const unsigned long long* p = h.data() + (size_t) b * 8;
+            t0 = p[0] < t0 ? p[0] : t0;
+            t4 = p[4] > t4 ? p[4] : t4;
+            for (int i = 0; i < 6; ++i) { const double v = (double) (p[order[i + 1]] - p[order[i]]) / 1e3; ph[i] += v / hch::NB; mx[i] = v > mx[i] ? v : mx[i]; }
+        }
+        double late = 0;
+        for (int b = 0; b < hch::NB; ++b) { const double v = (double) (h[(size_t) b * 8] - t0) / 1e3; late = v > late ? v : late; }
+        {   // the down phase per block group: the norm blocks, the other 5-row blocks, the 4-row blocks, the inject block
+            const int lim[5] = {0, HC * m.T, hch::NB5, hch::NB - 1, hch::NB};
+            const char* nm[4] = {"norm", "5-row", "4-row", "inject"};
+            std::string line = "hc half trace: down per block group (min/mean/max us):";
+            for (int gi = 0; gi < 4; ++gi) {
+                double mn = 1e9, mx2 = 0, su = 0; int n = 0;
+                for (int b = lim[gi]; b < lim[gi + 1]; ++b) {
+                    const unsigned long long* p = h.data() + (size_t) b * 8;
+                    const double v = (double) (p[2] - p[1]) / 1e3; mn = v < mn ? v : mn; mx2 = v > mx2 ? v : mx2; su += v; ++n;
+                }
+                char buf[96]; std::snprintf(buf, sizeof buf, " %s[%d] %.1f/%.1f/%.1f", nm[gi], n, n ? mn : 0.0, n ? su / n : 0.0, mx2);
+                line += buf;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+        std::fprintf(stderr, "hc half trace T %d: span %.1f us (first to last block); block start spread %.1f; mean/max per block: "
+                             "norm+flag %.1f/%.1f, down %.1f/%.1f, barrier %.1f/%.1f, up dots %.1f/%.1f, epilogue %.1f/%.1f, mixed %.1f/%.1f us\n",
+                     m.T, (double) (t4 - t0) / 1e3, late, ph[0], mx[0], ph[1], mx[1], ph[2], mx[2], ph[3], mx[3], ph[4], mx[4], ph[5], mx[5]);
+    }
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    return true;
+}
+}  // namespace
+
+void fused_gr_half_init() {
+    if (!hch::env_on()) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return;
+    hch::init_dev(dev);
+}
+int fused_gr_half_aborted() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+    hch::DevHalf& d = hch::g_half[dev];
+    if (!d.on) return 0;
+    std::lock_guard<std::mutex> lk(d.mu);
+    for (int i = 0; i < d.n_slots; ++i)
+        if (*d.slot[i].abort_h != 0u) return i + 1;
+    return 0;
+}
+#else
+namespace {
+bool half_dispatch(const GrMulti&, cudaStream_t, unsigned long long*, int) { return false; }
+}  // namespace
+void fused_gr_half_init() {}
+int fused_gr_half_aborted() { return 0; }
+#endif
 
 
 namespace {

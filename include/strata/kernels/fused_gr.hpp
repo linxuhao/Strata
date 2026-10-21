@@ -93,4 +93,13 @@ int fused_gr_variant();
 void fused_gr_persist_init();
 bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream);
 
+/// Opt-in STRATA_HC_FUSED=1 (CUDA, sm_80+ with 70+ multiprocessors; plan-decode step 5): the multi read of up to 6 tokens
+/// as ONE kernel of 70 blocks (the norm, the down projection and the up projection with a norm flag and one grid
+/// barrier), bitwise the default read.  `fused_gr_half_init` sets it up and checks it bit for bit on random data once
+/// per card (Verifier::init; a read with the switch on does it lazily outside capture); `fused_gr_read_multi` then
+/// takes it for bf16 reads without a q8_1 image.  `fused_gr_half_aborted` is non-zero once a read's barrier timed out
+/// on this card (that read's outputs are partial; the words stay set): the verifier checks it after every window.
+void fused_gr_half_init();
+int fused_gr_half_aborted();
+
 }  // namespace strata::kernels

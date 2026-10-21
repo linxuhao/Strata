@@ -687,6 +687,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
+    strata::kernels::fused_gr_half_init();      // opt-in STRATA_HC_FUSED=1 (CUDA sm_80+): the read as one kernel, bitwise
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -2997,6 +2998,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (!ok) return false;
         if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
         if (handoff_failed(err)) return false;   // a middle stage of three or more: its own hand-in
+        if (strata::kernels::fused_gr_half_aborted()) {   // STRATA_HC_FUSED: a read's barrier timed out - the window is not served
+            err = "verify: a fused hyper-connection read (STRATA_HC_FUSED=1) timed out at its grid barrier; restart the engine";
+            return false;
+        }
         if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871, as below
             *(volatile uint32_t*) h_plan_err_ = 0;
             err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
@@ -3024,6 +3029,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
+    if (strata::kernels::fused_gr_half_aborted()) {   // STRATA_HC_FUSED: a read's barrier timed out - the window is not served
+        err = "verify: a fused hyper-connection read (STRATA_HC_FUSED=1) timed out at its grid barrier; restart the engine";
+        return false;
+    }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";

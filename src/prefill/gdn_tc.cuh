@@ -11,12 +11,12 @@
 //   X^T  (16c x 32i) = S0^T . K^T        f16x3, k = state row (8 k16-steps), n = token (4 tiles)
 //   QS^T (16c x 32t) = S0^T . Q^T        the same A fragments
 //   Y^T  (16c x 32i) = beta_i (V^T - e_i X^T)                                     elementwise on the accumulators
-//   D^T  (16c x 32i) = Y^T . T^T         tf32x3 m16n8k8, k = token i' (4 steps), n = token i: T is zero above its
-//                                        diagonal, so the tiles with k-step > n-tile are skipped (10 of 16)
+//   D^T  (16c x 32i) = Y^T . T^T         f16x3, k = token i' (2 steps), n = token i: T is zero above its diagonal,
+//                                        so 6 of 8 tiles (as P below)
 //   o^T  (16c x 32t) = e_t QS^T + D^T . P^T   f16x3, k = i (2 steps), n = t: P zero above its diagonal (6 of 8 tiles)
 //   Dd^T (16c x 32i) = f_i D^T,  f_i = exp(gL - gamma_i)
 //   S^T  (16c x 128r) = eL S0^T + Dd^T . K    f16x3, k = token (2 steps), n = state row (16 tiles)
-// 336 mma a warp a chunk; the only shared data are the staged inputs (k and q as f16 hi / lo images, v, T, P, the
+// 324 mma a warp a chunk; the only shared data are the staged inputs (k, q, T and P as f16 hi / lo images, v, the
 // per-token scalars), one barrier a chunk.
 //
 // Numerics (the harness holds the result within 1e-4 of gdn_rec_kh_kernel, as the FP32 chunked pair): an f16 operand
@@ -24,9 +24,10 @@
 // both parts normal that is within 3 x 2^-22 |a||b| of the exact product, the 3xTF32 bound, at half the tensor time.
 // For the low part to be normal the operand's largest entry must sit in [2^14, 2^15), which a power of two does
 // exactly: k and q (unit vectors after gdn_l2_kernel) carry 2^8, P (|P| <= 1) 2^8, the state 2^es from a warp max
-// per chunk, D^T 2^ed likewise; the powers are taken out of the per-token scalars and of the accumulator before and
-// after the mma (one FMUL an element, exact).  T = (I + A)^-1 has no a-priori bound and Y carries v's magnitude, so
-// D^T = Y^T T^T runs on tf32 (the f32 exponent range), split the same way with cvt.rna.tf32.
+// per chunk, Y^T 2^ey and D^T 2^ed likewise, T = (I + A)^-1 (no a-priori bound) 2^et from the prep's warp max; the
+// powers are taken out of the per-token scalars and of the accumulator before and after the mma (one FMUL an
+// element, exact).  (D^T = Y^T T^T on tf32x3 with T split at use, the form before this one, cost 30 mma, 32 shuffles
+// and 48 tf32 conversions a warp a chunk against 18 mma now; measured in the commit that changed it.)
 #if !defined(__HIPCC__)
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 #define STRATA_GDN_TC_SM80 1
@@ -36,46 +37,48 @@
 
 constexpr int GTC_KP = S + 8;     // f16 k / q rows: a 272-B stride puts the 8 rows of a ldmatrix 8x8 on 8 distinct 16-B lanes
 constexpr int GTC_VP = S + 4;     // f32 v rows: lane (gid, tig) reads word 264 tig + gid, 32 distinct banks
-constexpr int GTC_TP = GCH + 4;   // f32 T rows: word 36 gid + tig, distinct banks
-constexpr int GTC_PP = GCH + 8;   // f16 P rows: an 80-B stride, 8 rows on distinct 16-B lanes
+constexpr int GTC_PP = GCH + 8;   // f16 T / P rows: an 80-B stride, 8 rows on distinct 16-B lanes
 constexpr int GTC_CW = S / 16;    // consumer warps a block: 16 value columns each
-// dynamic shared memory a block, two buffers each: k / q hi / lo, v, (z), T, P hi / lo, the token scalars
-// (beta, exp(gamma), exp(gL - gamma), gamma) as float4, (the norm's o^2 partials): 123,904 B without the fused norm,
-// 159,744 with it (the 166,912 opt-in of GA100)
+// dynamic shared memory a block, two buffers each: k / q hi / lo, v, (z), T hi / lo, P hi / lo, the token scalars
+// (beta, exp(gamma), exp(gL - gamma), gamma) as float4, (the norm's o^2 partials), T's scale 2^-et: 124,944 B
+// without the fused norm, 160,784 with it (the 166,912 opt-in of GA100)
 template <bool NORM>
 constexpr size_t kTcScanSmem = 2 * (4 * GCH * GTC_KP * 2 + GCH * GTC_VP * 4 + (NORM ? GCH * GTC_VP * 4 : 0) +
-                                    GCH * GTC_TP * 4 + 2 * GCH * GTC_PP * 2 + GCH * 16 + (NORM ? GCH * GTC_CW * 4 : 0));
-static_assert(kTcScanSmem<false> == 123904 && kTcScanSmem<true> == 159744, "gdn_tc.cuh: the shared-memory plan");
-// the prep's scratch for a super-block (gdn_tc_scratch, one a device, 60.3 MB): T as f32 [chunk][vh][GCH][GCH], the
-// token scalars as float4 [chunk][vh][GCH], the k and q f16 hi / lo images x 2^8 as [chunk][qh][4: k hi, k lo, q hi,
-// q lo][GCH][S] and the P images x 2^8 as [chunk][vh][2: hi, lo][GCH][GCH] - every row a multiple of 16 B, so the
-// scan stages all of it by cp.async
+                                    4 * GCH * GTC_PP * 2 + GCH * 16 + (NORM ? GCH * GTC_CW * 4 : 0)) + 16;
+static_assert(kTcScanSmem<false> == 124944 && kTcScanSmem<true> == 160784, "gdn_tc.cuh: the shared-memory plan");
+// the prep's scratch for a super-block (gdn_tc_scratch, one a device, 60.3 MB): the T images x 2^et as
+// [chunk][vh][2: hi, lo][GCH][GCH] f16 and their scales 2^-et as [chunk][vh], the token scalars as float4
+// [chunk][vh][GCH], the k and q images x 2^8 as [chunk][qh][4: k hi, k lo, q hi, q lo][GCH][S] and the P images x 2^8
+// as [chunk][vh][2: hi, lo][GCH][GCH] - every row a multiple of 16 B, so the scan stages all of it by cp.async
 constexpr int GTC_NB = GSB / GCH;
 struct GtcScratch {
-    float* tm;
+    uint16_t* ti;
+    float* te;
     float4* sc;
     uint16_t* kq;
     uint16_t* pi;
 };
-constexpr size_t kTcTmBytes = (size_t) GTC_NB * HV * GCH * GCH * 4, kTcScBytes = (size_t) GTC_NB * HV * GCH * 16,
-                 kTcKqBytes = (size_t) GTC_NB * HK * 4 * GCH * S * 2, kTcPiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2;
-static_assert(kTcTmBytes + kTcScBytes + kTcKqBytes + kTcPiBytes == 60293120, "gdn_tc.cuh: the scratch plan");
-// allocated on first use and kept, as gdn_chunk_scratch (kernels.cu); tm == nullptr when the card had no room
+constexpr size_t kTcTiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2, kTcTeBytes = (size_t) GTC_NB * HV * 4,
+                 kTcScBytes = (size_t) GTC_NB * HV * GCH * 16, kTcKqBytes = (size_t) GTC_NB * HK * 4 * GCH * S * 2,
+                 kTcPiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2;
+static_assert(kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes == 60305408, "gdn_tc.cuh: the scratch plan");
+// allocated on first use and kept, as gdn_chunk_scratch (kernels.cu); ti == nullptr when the card had no room
 GtcScratch gdn_tc_scratch() {
     static unsigned char* bufs[64] = {};
-    GtcScratch r = {nullptr, nullptr, nullptr, nullptr};
+    GtcScratch r = {nullptr, nullptr, nullptr, nullptr, nullptr};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return r; }
-    if (bufs[dev] == nullptr && cudaMalloc((void**) &bufs[dev], kTcTmBytes + kTcScBytes + kTcKqBytes + kTcPiBytes) != cudaSuccess) {
+    if (bufs[dev] == nullptr && cudaMalloc((void**) &bufs[dev], kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes) != cudaSuccess) {
         cudaGetLastError();
         bufs[dev] = nullptr;
         return r;
     }
     unsigned char* p = bufs[dev];
-    r.tm = reinterpret_cast<float*>(p);
-    r.sc = reinterpret_cast<float4*>(p + kTcTmBytes);
-    r.kq = reinterpret_cast<uint16_t*>(p + kTcTmBytes + kTcScBytes);
-    r.pi = reinterpret_cast<uint16_t*>(p + kTcTmBytes + kTcScBytes + kTcKqBytes);
+    r.ti = reinterpret_cast<uint16_t*>(p);
+    r.te = reinterpret_cast<float*>(p + kTcTiBytes);
+    r.sc = reinterpret_cast<float4*>(p + kTcTiBytes + kTcTeBytes);
+    r.kq = reinterpret_cast<uint16_t*>(p + kTcTiBytes + kTcTeBytes + kTcScBytes);
+    r.pi = reinterpret_cast<uint16_t*>(p + kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes);
     return r;
 }
 
@@ -107,8 +110,6 @@ __device__ __forceinline__ int gtc_scale_exp(float m) {
 //   m16n8k16 f16: A a0 = (row gid, cols 2tig, 2tig+1) a1 = (gid+8, ..) a2 = (gid, 2tig+8..) a3 = (gid+8, 2tig+8..);
 //                 B b0 = (k 2tig, 2tig+1; n gid) b1 = (k 2tig+8..; n gid); C/D c0 = (gid, 2tig) c1 = (gid, 2tig+1)
 //                 c2 = (gid+8, 2tig) c3 = (gid+8, 2tig+1) - so two adjacent C tiles ARE the next product's A fragment
-//   m16n8k8 tf32: A a0 = (gid, tig) a1 = (gid+8, tig) a2 = (gid, tig+4) a3 = (gid+8, tig+4); B b0 = (k tig, n gid)
-//                 b1 = (k tig+4, n gid); C as above
 //   ldmatrix m8n8.x4.b16: lanes 8m..8m+7 give the row addresses of matrix m; a lane gets (row gid, cols 2tig, 2tig+1)
 //                 of each matrix (the lower column in the low half), or with .trans (rows 2tig, 2tig+1; col gid)
 __device__ __forceinline__ void gtc_ldsm_x4(uint32_t (&r)[4], const void* smem) {
@@ -138,40 +139,12 @@ __device__ __forceinline__ void gtc_mma_f16(float (&c)[4], const uint32_t (&a)[4
     (void) c; (void) a; (void) b0; (void) b1; __trap();
 #endif
 }
-__device__ __forceinline__ void gtc_mma_tf32(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if STRATA_GDN_TC_SM80
-    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#else
-    (void) c; (void) a; (void) b0; (void) b1; __trap();
-#endif
-}
 // the three passes of a split product, small terms first (as qsa_select.cu): lo.hi, hi.lo, hi.hi
 __device__ __forceinline__ void gtc_mma3_f16(float (&c)[4], const uint32_t (&ah)[4], const uint32_t (&al)[4], uint32_t bh0,
                                              uint32_t bh1, uint32_t bl0, uint32_t bl1) {
     gtc_mma_f16(c, al, bh0, bh1);
     gtc_mma_f16(c, ah, bl0, bl1);
     gtc_mma_f16(c, ah, bh0, bh1);
-}
-__device__ __forceinline__ void gtc_mma3_tf32(float (&c)[4], const uint32_t (&ah)[4], const uint32_t (&al)[4], uint32_t bh0,
-                                              uint32_t bh1, uint32_t bl0, uint32_t bl1) {
-    gtc_mma_tf32(c, al, bh0, bh1);
-    gtc_mma_tf32(c, ah, bl0, bl1);
-    gtc_mma_tf32(c, ah, bh0, bh1);
-}
-__device__ __forceinline__ uint32_t gtc_tf32_hi(float x) {
-#if STRATA_GDN_TC_SM80
-    uint32_t r;
-    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
-    return r;
-#else
-    return __float_as_uint(x);
-#endif
-}
-__device__ __forceinline__ void gtc_tf32_split(float x, uint32_t& hi, uint32_t& lo) {
-    hi = gtc_tf32_hi(x);
-    lo = gtc_tf32_hi(x - __uint_as_float(hi));   // the residual is exact in f32
 }
 // x0, x1 -> packed f16 hi (x0 in the low half) and lo = f16(x - hi): x - hi is exact in f32 (hi carries x's exponent)
 __device__ __forceinline__ void gtc_split_f16x2(float x0, float x1, uint32_t& hi, uint32_t& lo) {
@@ -203,21 +176,6 @@ __device__ __forceinline__ float4 gtc_lds128(const float4* p) {
 #endif
     return v;
 }
-// a m16n8 f32 accumulator tile as the A tile of a m16n8k8 tf32 product (m = the same 16 rows, k = the tile's 8
-// columns): a0 = C(gid, tig) sits in lane 4 gid + (tig >> 1), its c0 (tig even) or c1 (odd); a1 the same lane's c2 /
-// c3; a2 = C(gid, tig + 4) in the lane two further on; a3 its c2 / c3.  8 shuffles.
-__device__ __forceinline__ void gtc_c2a_tf32(const float (&c)[4], float (&a)[4]) {
-    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
-    const int src0 = 4 * gid + (tig >> 1), src1 = src0 + 2;
-    const bool odd = tig & 1;
-    const unsigned mk = 0xffffffffu;   // the whole warp (see gtc_warp_max)
-    const float x0 = __shfl_sync(mk, c[0], src0), x1 = __shfl_sync(mk, c[1], src0);
-    const float x2 = __shfl_sync(mk, c[2], src0), x3 = __shfl_sync(mk, c[3], src0);
-    const float y0 = __shfl_sync(mk, c[0], src1), y1 = __shfl_sync(mk, c[1], src1);
-    const float y2 = __shfl_sync(mk, c[2], src1), y3 = __shfl_sync(mk, c[3], src1);
-    a[0] = odd ? x1 : x0; a[1] = odd ? x3 : x2; a[2] = odd ? y1 : y0; a[3] = odd ? y3 : y2;
-}
-
 // ---- the products of a chunk, a warp each (the self-test of gdn_rec_parity --selftest-frag runs them one by one)
 // X^T = S^T K^T and QS^T = S^T Q^T: A = the state fragments x sA (= 2^es) split in f16 hi / lo just in time per k16-step
 // (tiles 2kk and 2kk + 1 of S^T are that step's A fragment), B = the f16 hi / lo images of k and q ([GCH][GTC_KP] in
@@ -249,33 +207,10 @@ __device__ __forceinline__ void gtc_prod_state(const float (&s)[16][4], float sA
         }
     }
 }
-// D^T += Y^T T^T on tf32x3: A = the Y^T tile of k-step ks through gtc_c2a_tf32, B = T[i = 8 nt + gid][i' = 8 ks + tig]
-// and [.. + 4] from the f32 [GCH][GTC_TP] copy, split at use.  SKIP leaves out the tiles above T's diagonal (ks > nt):
-// they would add exact zeros.  30 (SKIP) or 48 mma.
-template <bool SKIP>
-__device__ __forceinline__ void gtc_prod_yt(const float (&yt)[4][4], const float* t, float (&dt)[4][4]) {
-    const int lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3;
-#pragma unroll
-    for (int ks = 0; ks < GCH / 8; ++ks) {
-        float a[4];
-        gtc_c2a_tf32(yt[ks], a);
-        uint32_t ah[4], al[4];
-#pragma unroll
-        for (int q = 0; q < 4; ++q) gtc_tf32_split(a[q], ah[q], al[q]);
-#pragma unroll
-        for (int nt = 0; nt < GCH / 8; ++nt) {
-            if (SKIP && nt < ks) continue;
-            const float* tp = t + (8 * nt + gid) * GTC_TP + 8 * ks + tig;
-            uint32_t bh[2], bl[2];
-            gtc_tf32_split(tp[0], bh[0], bl[0]);
-            gtc_tf32_split(tp[4], bh[1], bl[1]);
-            gtc_mma3_tf32(dt[nt], ah, al, bh[0], bh[1], bl[0], bl[1]);
-        }
-    }
-}
 // o^T += (sD D^T) (2^8 P^T) on f16x3: A = the D^T tiles x sD (= 2^ed) split per k16-step, B = the f16 hi / lo images
 // of P x 2^8 ([GCH][GTC_PP], rows = tokens t) by ldmatrix as in gtc_prod_state.  SKIP leaves out the tiles above P's
-// diagonal: tokens t < 16 (n-tiles 0, 1) see no i >= 16 (k-step 1).  18 (SKIP) or 24 mma.
+// diagonal: tokens t < 16 (n-tiles 0, 1) see no i >= 16 (k-step 1).  18 (SKIP) or 24 mma.  D^T += (sY Y^T) (2^et T^T)
+// is the same product on the T images (T is zero above its diagonal too), the accumulator x 2^(ey + et).
 template <bool SKIP>
 __device__ __forceinline__ void gtc_prod_dt(const float (&dt)[4][4], float sD, const uint16_t* ph, const uint16_t* pl,
                                             float (&ot)[4][4]) {
@@ -332,14 +267,16 @@ __device__ __forceinline__ void gtc_update_state(float (&s)[16][4], const float 
 // rows past the chunk's end zero: 48 mma a warp against ~1,150 LDS a thread for the FFMA form, which was LDS-bound at
 // 233 us a 2048-token super-block), and it writes what the scan stages by cp.async with no conversion of its own: the
 // same k / q images, P as f16 hi / lo images x 2^8 (the split the scan did, element by element) and the token scalars
-// (beta, exp(gamma), exp(gL - gamma), gamma) as a float4 a token; T stays f32 (split to tf32 at use).  The Gram
-// entries are within 3 x 2^-22 of exact (the scan's bound), so T and P differ from gdn_chunk_prep_kernel's by that.
+// (beta, exp(gamma), exp(gL - gamma), gamma) as a float4 a token, T as f16 hi / lo images x 2^et, et from the warp's
+// largest |T| (2^-et beside them in te).  The Gram entries are within 3 x 2^-22 of exact (the scan's bound), so T and
+// P differ from gdn_chunk_prep_kernel's by that.
 constexpr size_t kTcPrepSmem = (size_t) 4 * GCH * GTC_KP * 2 + 2 * GCH * GTP * 4;   // the images, then k_t.k_i and q_t.k_i
 static_assert(VPK * GCH * GTP * 4 <= 4 * GCH * GTC_KP * 2, "gdn_tc_prep_kernel: A fits where the images were");
 __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restrict__ h, const float* __restrict__ gate,
-                                                          const float* __restrict__ beta, float* __restrict__ tm,
-                                                          float4* __restrict__ sc, uint16_t* __restrict__ kq,
-                                                          uint16_t* __restrict__ pi, int64_t t0, int64_t T) {
+                                                          const float* __restrict__ beta, uint16_t* __restrict__ ti,
+                                                          float* __restrict__ te, float4* __restrict__ sc,
+                                                          uint16_t* __restrict__ kq, uint16_t* __restrict__ pi, int64_t t0,
+                                                          int64_t T) {
     extern __shared__ __align__(16) float gsm[];
     uint16_t* im = reinterpret_cast<uint16_t*>(gsm);   // [4][GCH][GTC_KP]  k hi, k lo, q hi, q lo (x 2^8)
     float* skk = gsm + 4 * GCH * GTC_KP / 2;           // [GCH][GTP]  k_t.k_i
@@ -446,9 +383,22 @@ __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restric
         for (int k = 0; k < t; ++k) v = fmaf(-a[t * GTP + k], tv[k], v);
         tv[t] = i < t ? v : (i == t ? 1.0f : 0.0f);
     }
-    float* T_ = tm + ((int64_t) ch * HV + vh) * GCH * GCH;
+    // T's images x 2^et (its largest entry in [2^14, 2^15), as the scan scales its own operands)
+    float mt4[4] = {};
 #pragma unroll
-    for (int t = 0; t < GCH; ++t) T_[t * GCH + i] = tv[t];
+    for (int t = 0; t < GCH; ++t) mt4[t & 3] = fmaxf(mt4[t & 3], fabsf(tv[t]));
+    const int et = gtc_scale_exp(gtc_warp_max(fmaxf(fmaxf(mt4[0], mt4[1]), fmaxf(mt4[2], mt4[3]))));
+    const float sT = gtc_pow2(et);
+    uint16_t* Th = ti + ((int64_t) ch * HV + vh) * 2 * GCH * GCH;
+    uint16_t* Tl = Th + GCH * GCH;
+#pragma unroll
+    for (int t = 0; t < GCH; ++t) {
+        const float x = tv[t] * sT;
+        const __half hi = __float2half_rn(x);
+        Th[t * GCH + i] = __half_as_ushort(hi);
+        Tl[t * GCH + i] = __half_as_ushort(__float2half_rn(x - __half2float(hi)));
+    }
+    if (i == 0) te[(int64_t) ch * HV + vh] = gtc_pow2(-et);
 }
 
 // ---- the scan: a block per value head (48 blocks, one wave on 48 of the CMP 170HX's 70 SMs), 8 consumer warps of 16
@@ -466,9 +416,9 @@ __global__ void __launch_bounds__(256) gdn_tc_prep_kernel(const float* __restric
 // output as gdn_chunk_scan_kernel writes it.
 template <bool NORM>
 __global__ void __launch_bounds__(GTC_CW * 32, 1)
-gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ tm,
-                   const float4* __restrict__ scg, const uint16_t* __restrict__ kqg, const uint16_t* __restrict__ pig,
-                   float* __restrict__ oc_out, int64_t t0, int nch, int64_t T) {
+gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const uint16_t* __restrict__ tig_,
+                   const float* __restrict__ teg, const float4* __restrict__ scg, const uint16_t* __restrict__ kqg,
+                   const uint16_t* __restrict__ pig, float* __restrict__ oc_out, int64_t t0, int nch, int64_t T) {
     static_assert(!NORM, "gdn_tc_scan_kernel: the fused output norm is not implemented yet");
     constexpr int NT = GTC_CW * 32;
     extern __shared__ __align__(16) unsigned char gtc_sm[];
@@ -477,15 +427,18 @@ gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const
     uint16_t* qh = kl + 2 * GCH * GTC_KP;                               // q likewise
     uint16_t* ql = qh + 2 * GCH * GTC_KP;
     float* sv = reinterpret_cast<float*>(ql + 2 * GCH * GTC_KP);        // [2][GCH][GTC_VP]  v
-    float* st = sv + 2 * GCH * GTC_VP;                                  // [2][GCH][GTC_TP]  T
-    uint16_t* ph = reinterpret_cast<uint16_t*>(st + 2 * GCH * GTC_TP);  // [2][GCH][GTC_PP]  P x 2^8 hi / lo
+    uint16_t* th = reinterpret_cast<uint16_t*>(sv + 2 * GCH * GTC_VP);  // [2][GCH][GTC_PP]  T x 2^et hi / lo
+    uint16_t* tl = th + 2 * GCH * GTC_PP;
+    uint16_t* ph = tl + 2 * GCH * GTC_PP;                               // [2][GCH][GTC_PP]  P x 2^8 hi / lo
     uint16_t* pl = ph + 2 * GCH * GTC_PP;
     float4* sc = reinterpret_cast<float4*>(pl + 2 * GCH * GTC_PP);      // [2][GCH]  (beta, exp(gamma), exp(gL - gamma), gamma)
+    float* ste = reinterpret_cast<float*>(sc + 2 * GCH);                // [2]  2^-et
     const int vh = blockIdx.x, qhd = vh % HK;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
     const size_t rs = (size_t) HV * S;
     // chunk ch into buffer b, this thread's 16-B pieces (one cp.async group): the four k / q images (4 x GCH rows of
-    // 16 pieces: 8 a thread), v (4 a thread), T (1), the two P images (1), the scalars (warp 0, 1)
+    // 16 pieces: 8 a thread), v (4 a thread), the two T images (1), the two P images (1), the scalars (warp 0, 1),
+    // T's scale (thread 0, 4 B)
     auto stage = [&](int ch, int b) {
         const int64_t c_t0 = t0 + (int64_t) ch * GCH;
         const int n = (int) min((int64_t) GCH, T - c_t0);
@@ -504,15 +457,14 @@ gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const
             else *reinterpret_cast<float4*>(dst) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         {
-            const int t = tid / (GCH / 4), i = (tid % (GCH / 4)) * 4;
-            gdn_cp16(st + (b * GCH + t) * GTC_TP + i, tm + (((int64_t) ch * HV + vh) * GCH + t) * GCH + i);
-        }
-        {
             const int im = tid / (GCH * GCH / 8), t = (tid % (GCH * GCH / 8)) / (GCH / 8), i = (tid % (GCH / 8)) * 8;
-            gdn_cp16(reinterpret_cast<float*>((im ? pl : ph) + (b * GCH + t) * GTC_PP + i),
-                     reinterpret_cast<const float*>(pig + ((((int64_t) ch * HV + vh) * 2 + im) * GCH + t) * GCH + i));
+            const int64_t src = ((((int64_t) ch * HV + vh) * 2 + im) * GCH + t) * GCH + i;
+            const int dst = (b * GCH + t) * GTC_PP + i;
+            gdn_cp16(reinterpret_cast<float*>((im ? tl : th) + dst), reinterpret_cast<const float*>(tig_ + src));
+            gdn_cp16(reinterpret_cast<float*>((im ? pl : ph) + dst), reinterpret_cast<const float*>(pig + src));
         }
         if (tid < GCH) gdn_cp16(reinterpret_cast<float*>(sc + b * GCH + tid), reinterpret_cast<const float*>(scg + ((int64_t) ch * HV + vh) * GCH + tid));
+        if (tid == 0) gdn_cp4(ste + b, teg + (int64_t) ch * HV + vh);
         gdn_cp_commit();
     };
     const int c0 = 16 * warp;   // the warp's value columns c0 + gid and c0 + gid + 8
@@ -537,10 +489,11 @@ gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const
         const uint16_t* bkl = kl + b * GCH * GTC_KP;
         const uint16_t* bqh = qh + b * GCH * GTC_KP;
         const uint16_t* bql = ql + b * GCH * GTC_KP;
+        const uint16_t* bth = th + b * GCH * GTC_PP;
+        const uint16_t* btl = tl + b * GCH * GTC_PP;
         const uint16_t* bph = ph + b * GCH * GTC_PP;
         const uint16_t* bpl = pl + b * GCH * GTC_PP;
         const float* bsv = sv + b * GCH * GTC_VP;
-        const float* bst = st + b * GCH * GTC_TP;
         const float4* bsc = sc + b * GCH;
         // (a) X^T = S0^T K^T and QS^T = S0^T Q^T, the state x 2^es (its largest entry in [2^14, 2^15)).  The lane's
         // maximum over eight chains (nvcc keeps the order written: one chain was 64 dependent FMNMX before the first mma)
@@ -567,9 +520,21 @@ gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h, const
             yt[nt][2] = s0.x * fmaf(-e0, xt[nt][2], v[8]);
             yt[nt][3] = s1.x * fmaf(-e1, xt[nt][3], v[GTC_VP + 8]);
         }
-        // (c) D^T = Y^T T^T on tf32x3 (T above its diagonal skipped)
+        // (c) D^T = Y^T T^T on f16x3: Y^T x 2^ey (its largest entry in [2^14, 2^15)), T's images x 2^et from the prep;
+        // the accumulator comes out x 2^(ey + et) (T above its diagonal skipped)
+        float my4[4] = {};
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) my4[q] = fmaxf(my4[q], fabsf(yt[nt][q]));
+        const int ey = gtc_scale_exp(gtc_warp_max(fmaxf(fmaxf(my4[0], my4[1]), fmaxf(my4[2], my4[3]))));
         float dt[4][4] = {};
-        gtc_prod_yt<true>(yt, bst, dt);
+        gtc_prod_dt<true>(yt, gtc_pow2(ey), bth, btl, dt);
+        const float sYT = gtc_pow2(-ey) * ste[b];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) dt[nt][q] *= sYT;
         // (d) o^T = e_t QS^T + D^T P^T: the accumulator starts as 2^(ed + 8) e_t QS^T (QS^T came out x 2^(8 + es)),
         // D^T goes in x 2^ed, P x 2^8; the output is the accumulator x 2^-(ed + 8), then rsqrt(S) as gdn_chunk_scan_kernel
         float md4[4] = {};

@@ -1219,7 +1219,7 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
 }
 // STRATA_GDN_TC=1: gdn_rec_chunked with the scan on the tensor cores (gdn_tc_scan_kernel, gdn_tc.cuh) and the prep
 // that also writes its f16 images (gdn_tc_prep_kernel, scratch gdn_tc_scratch), 48 blocks of 256 threads in one wave.  An error return means nothing was launched: the card is below
-// sm_80, has fewer than 48 SMs, or less than 121 KB of shared memory a block.  Not called by the dispatch yet.
+// sm_80, has fewer than 48 SMs, or less than 122 KB of shared memory a block.  Not called by the dispatch yet.
 cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
                        cudaStream_t s) {
     if (T <= 0) return cudaSuccess;
@@ -1236,7 +1236,7 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
             return cudaErrorNotSupported;
     }
     const GtcScratch sc = gdn_tc_scratch();
-    if (sc.tm == nullptr) return cudaErrorMemoryAllocation;
+    if (sc.ti == nullptr) return cudaErrorMemoryAllocation;
     {   // once a device
         static bool attrs[64] = {};
         int dev = 0;
@@ -1248,8 +1248,8 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
     }
     for (int64_t t0 = 0; t0 < T; t0 += GSB) {
         const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
-        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kTcPrepSmem, s>>>(h, gate, beta, sc.tm, sc.sc, sc.kq, sc.pi, t0, T);
-        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, sc.tm, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
+        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kTcPrepSmem, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
     }
     return cudaSuccess;
 }

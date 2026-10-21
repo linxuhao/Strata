@@ -613,7 +613,7 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
         if (major < 8 || sms < HV || (size_t) smem < kTcScanSmem<false>) return cudaErrorNotSupported;
     }
     const GtcScratch sc = gdn_tc_scratch();
-    if (sc.tm == nullptr) return cudaErrorMemoryAllocation;
+    if (sc.ti == nullptr) return cudaErrorMemoryAllocation;
     {   // once a device
         static bool attrs[64] = {};
         int dev = 0;
@@ -625,8 +625,8 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
     }
     for (int64_t t0 = 0; t0 < T; t0 += GSB) {
         const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
-        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kTcPrepSmem, s>>>(h, gate, beta, sc.tm, sc.sc, sc.kq, sc.pi, t0, T);
-        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, sc.tm, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
+        gdn_tc_prep_kernel<<<dim3((unsigned) nch, HK), 256, kTcPrepSmem, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
     }
     return cudaSuccess;
 }
@@ -699,7 +699,7 @@ __global__ void fill_gates(float* gate, float* beta, int64_t n, uint64_t seed, b
     }
 }
 // coherent keys: every token's k row = a key head's k_0 + 0.05 x the row that was there (before l2_rows): the
-// chunk's T = (I + A)^-1 then carries large entries, the tf32 product's reason
+// chunk's T = (I + A)^-1 then carries large entries, the reason the prep scales its T images by a power of two of their own
 __global__ void coherent_k(float* h, uint64_t seed) {
     float* x = h + (int64_t) blockIdx.y * C + HK * S + (int64_t) blockIdx.x * S;
     x[threadIdx.x] = gauss(seed * 0x9E3779B97F4A7C15ULL + (uint64_t) (blockIdx.x * S + threadIdx.x)) + 0.05f * x[threadIdx.x];
@@ -956,7 +956,7 @@ int check_chunked(int64_t T, uint64_t seed) {
     Inputs in(T, seed);
     return check_variant(in, "chunked (STRATA_GDN_CHUNKED)", gdn_rec_chunked, "sm_80+, 128 SMs, 93.7 KB a block");
 }
-constexpr const char* kTcNeeds = "sm_80+, 48 SMs, 121 KB a block";
+constexpr const char* kTcNeeds = "sm_80+, 48 SMs, 122 KB a block";
 int check_tc(int64_t T, uint64_t seed) {
     Inputs in(T, seed);
     return check_variant(in, "tc (STRATA_GDN_TC=1)", gdn_rec_tc, kTcNeeds);
@@ -979,22 +979,13 @@ int check_tc_stress(int64_t T, uint64_t seed) {
 }
 
 // ------------------------------------------------------------------ the tensor-core scan's fragment self-test (--selftest-frag)
-// One warp each, random inputs, the reference in double on the host: (a) gtc_c2a_tf32 against the fragment rule,
-// (b) a 16x128 . 128x32 product through gtc_prod_state (the f16 split with the state's 2^es and k's 2^8, ldmatrix),
-// (c) a 16x32 . 32x128 update through gtc_update_state (ldmatrix.trans, the 2^ed scale, the accumulator's pre / post
-// scale), (d) a 16x32 . 32x32 product through gtc_prod_yt on tf32x3 with the shuffled A tile, (e) the triangle-skipped
-// tile sets of gtc_prod_yt and gtc_prod_dt against the full ones on triangular T / P: the same bits, since the
-// skipped tiles add exact zeros.  Most bugs of a tensor-core kernel are fragment-layout bugs: these catch them before
-// the kernel does.
-__global__ void st_c2a_kernel(const float* m, float* out) {   // m: 16 x 8 (a C tile), out: a lane's a[4]
-    const int lane = threadIdx.x, gid = lane >> 2, tig = lane & 3;
-    const float c[4] = {m[gid * 8 + 2 * tig], m[gid * 8 + 2 * tig + 1], m[(gid + 8) * 8 + 2 * tig],
-                        m[(gid + 8) * 8 + 2 * tig + 1]};
-    float a[4];
-    gtc_c2a_tf32(c, a);
-#pragma unroll
-    for (int q = 0; q < 4; ++q) out[lane * 4 + q] = a[q];
-}
+// One warp each, random inputs, the reference in double on the host: (b) a 16x128 . 128x32 product through
+// gtc_prod_state (the f16 split with the state's 2^es and k's 2^8, ldmatrix), (c) a 16x32 . 32x128 update through
+// gtc_update_state (ldmatrix.trans, the 2^ed scale, the accumulator's pre / post scale), (d) a 16x32 . 32x32 product
+// through gtc_prod_dt on a full random T of wide range (the prep's 2^et on the B images), (e) the triangle-skipped
+// tile sets of gtc_prod_dt against the full ones on triangular T / P: the same bits, since the skipped tiles add
+// exact zeros.  Most bugs of a tensor-core kernel are fragment-layout bugs: these catch them before the kernel does.
+// ((a), the C -> A tf32 shuffle, went with the tf32 form of D^T.)
 __device__ void st_stage_k(uint16_t* kh, uint16_t* kl, const float* k) {   // k: 32 x 128 f32 -> the hi / lo images x 2^8
     for (int p = threadIdx.x; p < GCH * S / 4; p += 32) {
         const int t = p / (S / 4), r = (p % (S / 4)) * 4;
@@ -1061,27 +1052,28 @@ __global__ void st_update_kernel(const float* s0, const float* dd, const float* 
     gtc_update_state(s, ddt, kh, kl);
     st_store_c<16>(s, out, S, gtc_pow2(-(ed + 8)));
 }
-template <bool SKIP> __global__ void st_yt_kernel(const float* y, const float* t, float* out) {   // out (16 x 32) = y t^T
-    __shared__ __align__(16) float st[GCH * GTC_TP];
-    for (int p = threadIdx.x; p < GCH * GCH; p += 32) st[(p / GCH) * GTC_TP + p % GCH] = t[p];
-    __syncwarp();
-    float yt[4][4], dt[4][4] = {};
-    st_load_c<4>(yt, y, GCH);
-    gtc_prod_yt<SKIP>(yt, st, dt);
-    st_store_c<4>(dt, out, GCH, 1.0f);
-}
-template <bool SKIP> __global__ void st_dt_kernel(const float* d, const float* p, float* out) {   // out (16 x 32) = d p^T
+// out (16 x 32) = d p^T: p's images x 2^eb (the scan's P carry 2^8, its T the prep's 2^et), d x 2^ed from its maximum
+template <bool SKIP> __global__ void st_dt_kernel(const float* d, const float* p, int eb, float* out) {
     __shared__ __align__(16) uint16_t ph[GCH * GTC_PP], pl[GCH * GTC_PP];
     for (int q = threadIdx.x; q < GCH * GCH / 4; q += 32) {
         const int t = q / (GCH / 4), i = (q % (GCH / 4)) * 4;
-        gtc_split_store4(ph + t * GTC_PP + i, pl + t * GTC_PP + i, *reinterpret_cast<const float4*>(p + t * GCH + i), 256.0f);
+        gtc_split_store4(ph + t * GTC_PP + i, pl + t * GTC_PP + i, *reinterpret_cast<const float4*>(p + t * GCH + i), gtc_pow2(eb));
     }
     __syncwarp();
     float dt[4][4], ot[4][4] = {};
     st_load_c<4>(dt, d, GCH);
     const int ed = gtc_scale_exp(st_max_abs<4>(dt));
     gtc_prod_dt<SKIP>(dt, gtc_pow2(ed), ph, pl, ot);
-    st_store_c<4>(ot, out, GCH, gtc_pow2(-(ed + 8)));
+    st_store_c<4>(ot, out, GCH, gtc_pow2(-(ed + eb)));
+}
+int st_scale_exp(const std::vector<float>& m) {   // the prep's gtc_scale_exp on the host: max |m| into [2^14, 2^15)
+    float mx = 0.0f;
+    for (float x : m) mx = std::max(mx, std::fabs(x));
+    if (mx == 0.0f) return 0;
+    int e = 0;
+    std::frexp(mx, &e);   // mx = f 2^e, f in [0.5, 1): floor(log2 mx) = e - 1
+    e = 14 - (e - 1);
+    return e < -40 ? -40 : (e > 40 ? 40 : e);
 }
 struct StRng {   // xorshift64, host side
     uint64_t s;
@@ -1120,23 +1112,6 @@ int selftest_frag() {
             for (int r = 0; r < cols; ++r) k[t * cols + r] = (float) (k[t * cols + r] / std::sqrt(ss));
         }
     };
-    {   // (a) the C -> A (tf32) shuffle against the fragment rule
-        std::vector<float> m(16 * 8);
-        for (float& x : m) x = rng.gauss();
-        float* dm = st_upload(m);
-        float* dout = dalloc<float>(32 * 4);
-        st_c2a_kernel<<<1, 32>>>(dm, dout);
-        const std::vector<float> out = st_download(dout, 32 * 4);
-        int bad = 0;
-        for (int lane = 0; lane < 32; ++lane) {
-            const int gid = lane >> 2, tig = lane & 3;
-            const float want[4] = {m[gid * 8 + tig], m[(gid + 8) * 8 + tig], m[gid * 8 + tig + 4], m[(gid + 8) * 8 + tig + 4]};
-            for (int q = 0; q < 4; ++q) bad += out[lane * 4 + q] != want[q];
-        }
-        std::printf("  (a) gtc_c2a_tf32 (C tile -> tf32 A tile, 8 shuffles): %d of 128 values wrong  %s\n", bad, bad ? "FAIL" : "ok");
-        fails += bad != 0;
-        cudaFree(dm); cudaFree(dout);
-    }
     {   // (b) X^T = S^T K^T: f16x3 with the state's 2^es and k's 2^8, B by ldmatrix
         std::vector<float> a(16 * S), k(GCH * S);
         for (float& x : a) x = rng.logmag(-3.0f, 2.0f);
@@ -1182,7 +1157,7 @@ int selftest_frag() {
         fails += bad;
         cudaFree(ds); cudaFree(dd_); cudaFree(dk); cudaFree(dout);
     }
-    {   // (d) D^T = Y^T T^T on tf32x3 through gtc_c2a_tf32, a full random T
+    {   // (d) D^T = Y^T T^T on f16x3 through gtc_prod_dt, a full random T of wide range with the prep's 2^et
         std::vector<float> y(16 * GCH), t(GCH * GCH);
         for (float& x : y) x = rng.logmag(-3.0f, 2.0f);
         for (float& x : t) x = rng.logmag(-2.0f, 3.0f);
@@ -1196,10 +1171,10 @@ int selftest_frag() {
         float* dy = st_upload(y);
         float* dt_ = st_upload(t);
         float* dout = dalloc<float>(16 * GCH);
-        st_yt_kernel<false><<<1, 32>>>(dy, dt_, dout);
+        st_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), dout);
         const double rel = st_max_rel(st_download(dout, 16 * GCH), ref);
         const bool bad = !(rel <= 2e-6);
-        std::printf("  (d) D^T = Y^T T^T (16x32 . 32x32, tf32x3, c2a): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
+        std::printf("  (d) D^T = Y^T T^T (16x32 . 32x32, f16x3, Y x 2^ey, T x 2^et): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
         fails += bad;
         cudaFree(dy); cudaFree(dt_); cudaFree(dout);
     }
@@ -1226,13 +1201,13 @@ int selftest_frag() {
         float* dp = st_upload(p);
         float* full = dalloc<float>(16 * GCH);
         float* skip = dalloc<float>(16 * GCH);
-        st_yt_kernel<false><<<1, 32>>>(dy, dt_, full);
-        st_yt_kernel<true><<<1, 32>>>(dy, dt_, skip);
+        st_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), full);
+        st_dt_kernel<true><<<1, 32>>>(dy, dt_, st_scale_exp(t), skip);
         const std::vector<float> f1 = st_download(full, 16 * GCH), s1 = st_download(skip, 16 * GCH);
         const unsigned long long diff1 = std::memcmp(f1.data(), s1.data(), 16 * GCH * 4) != 0 ? diff_words(full, skip, 16 * GCH * 4) : 0;
         const double rel1 = st_max_rel(s1, ref_d);
-        st_dt_kernel<false><<<1, 32>>>(dd_, dp, full);
-        st_dt_kernel<true><<<1, 32>>>(dd_, dp, skip);
+        st_dt_kernel<false><<<1, 32>>>(dd_, dp, 8, full);
+        st_dt_kernel<true><<<1, 32>>>(dd_, dp, 8, skip);
         const std::vector<float> f2 = st_download(full, 16 * GCH), s2 = st_download(skip, 16 * GCH);
         const unsigned long long diff2 = std::memcmp(f2.data(), s2.data(), 16 * GCH * 4) != 0 ? diff_words(full, skip, 16 * GCH * 4) : 0;
         const double rel2 = st_max_rel(s2, ref_o);

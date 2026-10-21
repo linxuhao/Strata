@@ -149,6 +149,19 @@ __device__ __forceinline__ void gtc_split_store4(uint16_t* hi, uint16_t* lo, flo
     *reinterpret_cast<uint2*>(hi) = make_uint2(h0, h1);
     *reinterpret_cast<uint2*>(lo) = make_uint2(l0, l1);
 }
+// a float4 from shared memory the compiler does not keep: the per-token scalars are read in three phases of a chunk,
+// a component each, and kept across them they cost 24 registers a thread
+__device__ __forceinline__ float4 gtc_lds128(const float4* p) {
+    float4 v;
+#if STRATA_GDN_TC_SM80
+    asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "r"((unsigned) __cvta_generic_to_shared(p)));
+#else
+    v = *p;
+#endif
+    return v;
+}
 // a m16n8 f32 accumulator tile as the A tile of a m16n8k8 tf32 product (m = the same 16 rows, k = the tile's 8
 // columns): a0 = C(gid, tig) sits in lane 4 gid + (tig >> 1), its c0 (tig even) or c1 (odd); a1 the same lane's c2 /
 // c3; a2 = C(gid, tig + 4) in the lane two further on; a3 its c2 / c3.  8 shuffles.
@@ -268,6 +281,239 @@ __device__ __forceinline__ void gtc_update_state(float (&s)[16][4], const float 
             gtc_mma3_f16(s[2 * hf], ah, al, bh[0], bh[1], bl[0], bl[1]);
             gtc_mma3_f16(s[2 * hf + 1], ah, al, bh[2], bh[3], bl[2], bl[3]);
         }
+    }
+}
+
+// ---- the scan: a block per value head (48 blocks, one wave on 48 of the CMP 170HX's 70 SMs), 8 consumer warps of 16
+// value columns each walking every chunk of the super-block with their state slice in registers (written back at the
+// end as gdn_chunk_scan_kernel does), the same prep scratch (tm, pm, gm).  v0: the 256 threads stage cooperatively
+// and one __syncthreads a chunk publishes the buffer just staged and ends every read of the other one.  The next
+// chunk's v goes by cp.async at the chunk's start; its k and q rows (split to f16 hi / lo in registers, so not by
+// cp.async), T, P and the token scalars are loaded, split and stored after the state update, where only the 64 state
+// registers are live (held across the products they cost 32 registers a thread and ptxas spilled at 255), and the
+// rows of the chunk after next are prefetched into L2 at the chunk's start so those loads are L2 hits.
+// NORM (step 5: the output norm fused, the FP16 output written here) is not implemented yet; oc_out takes the FP32
+// output as gdn_chunk_scan_kernel writes it.
+template <bool NORM>
+__global__ void __launch_bounds__(GTC_CW * 32, 1) gdn_tc_scan_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                   const float* __restrict__ beta, const float* __restrict__ tm,
+                                                                   const float* __restrict__ pm, const float* __restrict__ gm,
+                                                                   float* __restrict__ oc_out, int64_t t0, int nch, int64_t T) {
+    static_assert(!NORM, "gdn_tc_scan_kernel: the fused output norm is not implemented yet");
+    constexpr int NT = GTC_CW * 32;
+    extern __shared__ __align__(16) unsigned char gtc_sm[];
+    uint16_t* kh = reinterpret_cast<uint16_t*>(gtc_sm);                 // [2][GCH][GTC_KP]  f16 of k x 2^8 (hi)
+    uint16_t* kl = kh + 2 * GCH * GTC_KP;                               // [2][GCH][GTC_KP]  what hi left out (lo)
+    uint16_t* qh = kl + 2 * GCH * GTC_KP;                               // q likewise
+    uint16_t* ql = qh + 2 * GCH * GTC_KP;
+    float* sv = reinterpret_cast<float*>(ql + 2 * GCH * GTC_KP);        // [2][GCH][GTC_VP]  v
+    float* st = sv + 2 * GCH * GTC_VP;                                  // [2][GCH][GTC_TP]  T
+    uint16_t* ph = reinterpret_cast<uint16_t*>(st + 2 * GCH * GTC_TP);  // [2][GCH][GTC_PP]  P x 2^8 hi / lo
+    uint16_t* pl = ph + 2 * GCH * GTC_PP;
+    float4* sc = reinterpret_cast<float4*>(pl + 2 * GCH * GTC_PP);      // [2][GCH]  (beta, exp(gamma), exp(gL - gamma), gamma)
+    float* seL = reinterpret_cast<float*>(sc + 2 * GCH);                // [2]  exp(gL)
+    const int vh = blockIdx.x, qhd = vh % HK;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int c0 = 16 * warp;   // the warp's value columns c0 + gid and c0 + gid + 8
+    const size_t rs = (size_t) HV * S;
+    constexpr int KQ4 = 2 * GCH * S / 4 / NT, V4 = GCH * S / 4 / NT;   // float4 of k and q, of v, a thread a chunk
+    auto kq_at = [&](int m, bool& isq, int& t, int& r) {
+        const int p = tid + NT * m;
+        isq = p >= GCH * S / 4;
+        const int pp = p & (GCH * S / 4 - 1);
+        t = pp / (S / 4);
+        r = (pp % (S / 4)) * 4;
+    };
+    auto load_kq = [&](int64_t c_t0, int n, float4 (&kq)[KQ4]) {   // rows past the chunk's end: zero
+#pragma unroll
+        for (int m = 0; m < KQ4; ++m) {
+            bool isq; int t, r;
+            kq_at(m, isq, t, r);
+            kq[m] = t < n ? __ldg(reinterpret_cast<const float4*>(h + (c_t0 + t) * C + (isq ? 0 : HK * S) + qhd * S + r))
+                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    auto store_kq = [&](int b, const float4 (&kq)[KQ4]) {
+#pragma unroll
+        for (int m = 0; m < KQ4; ++m) {
+            bool isq; int t, r;
+            kq_at(m, isq, t, r);
+            const int o = (b * GCH + t) * GTC_KP + r;
+            gtc_split_store4((isq ? qh : kh) + o, (isq ? ql : kl) + o, kq[m], 256.0f);
+        }
+    };
+    auto stage_v = [&](int b, int64_t c_t0, int n) {
+#pragma unroll
+        for (int m = 0; m < V4; ++m) {
+            const int p = tid + NT * m, t = p / (S / 4), r = (p % (S / 4)) * 4;
+            float* dst = sv + (b * GCH + t) * GTC_VP + r;
+            if (t < n) gdn_cp16(dst, h + (c_t0 + t) * C + 2 * HK * S + vh * S + r);
+            else *reinterpret_cast<float4*>(dst) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    // a chunk's T and P rows (the prep's f32 [GCH][GCH]): a float4 of each a thread
+    auto load_tp = [&](int ch, float4& t4, float4& p4) {
+        const int t = tid / (GCH / 4), i = (tid % (GCH / 4)) * 4;
+        const int64_t at = (((int64_t) ch * HV + vh) * GCH + t) * GCH + i;
+        t4 = __ldg(reinterpret_cast<const float4*>(tm + at));
+        p4 = __ldg(reinterpret_cast<const float4*>(pm + at));
+    };
+    auto store_tp = [&](int b, float4 t4, float4 p4) {
+        const int t = tid / (GCH / 4), i = (tid % (GCH / 4)) * 4;
+        *reinterpret_cast<float4*>(st + (b * GCH + t) * GTC_TP + i) = t4;
+        const int o = (b * GCH + t) * GTC_PP + i;
+        gtc_split_store4(ph + o, pl + o, p4, 256.0f);
+    };
+    // the token scalars, warp 0, a lane per token: beta (0 past the chunk's end, as the prep's gate 0 keeps gamma)
+    auto load_sc = [&](int ch, int64_t c_t0, int n, float& bet, float& gam, float& gL) {
+        if (warp == 0) {
+            bet = lane < n ? __ldg(beta + (c_t0 + lane) * HV + vh) : 0.0f;
+            const float* g = gm + ((int64_t) ch * HV + vh) * GCH;
+            gam = __ldg(g + lane);
+            gL = __ldg(g + GCH - 1);
+        }
+    };
+    auto store_sc = [&](int b, float bet, float gam, float gL) {
+        if (warp == 0) {
+            sc[b * GCH + lane] = make_float4(bet, expf(gam), expf(gL - gam), gam);
+            if (lane == 0) seL[b] = expf(gL);
+        }
+    };
+    // the state slice as S^T fragments: tile j = rows 8j..8j+7; s[j][0] = S[8j + 2tig][c0 + gid], [1] the row after,
+    // [2] column + 8, [3] both (64 scalar loads a lane, 32-B runs, once a launch)
+    float s[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const float* p = state + (size_t) (8 * j + 2 * tig) * rs + (size_t) vh * S + c0 + gid;
+        s[j][0] = p[0]; s[j][1] = p[rs]; s[j][2] = p[8]; s[j][3] = p[rs + 8];
+    }
+    {   // chunk 0 into buffer 0
+        const int n0 = (int) min((int64_t) GCH, T - t0);
+        float4 kq[KQ4], t4, p4;
+        float bet = 0.0f, gam = 0.0f, gL = 0.0f;
+        load_kq(t0, n0, kq);
+        load_tp(0, t4, p4);
+        load_sc(0, t0, n0, bet, gam, gL);
+        stage_v(0, t0, n0);
+        gdn_cp_commit();
+        store_kq(0, kq);
+        store_tp(0, t4, p4);
+        store_sc(0, bet, gam, gL);
+        gdn_cp_wait_all();
+    }
+    const float out_scale = rsqrtf((float) S);
+    for (int ch = 0; ch < nch; ++ch) {
+        __syncthreads();   // chunk ch's buffer complete (every thread's cp.async waited); every read of the other one done
+        const int b = ch & 1;
+        const int64_t c_t0 = t0 + (int64_t) ch * GCH;
+        const int n = (int) min((int64_t) GCH, T - c_t0);
+        const bool more = ch + 1 < nch;
+        const int64_t n_t0 = c_t0 + GCH;
+        const int nn = more ? (int) min((int64_t) GCH, T - n_t0) : 0;
+        if (more) {   // the next chunk's v into the other buffer (chunk ch - 1 finished reading it before the barrier);
+                      // the k and q rows and T / P of the chunk after next into L2 (its k / q rows: 32 x 2 x 512 B)
+            stage_v(b ^ 1, n_t0, nn);
+            gdn_cp_commit();
+            const int64_t f_t0 = n_t0 + GCH;
+            const int t = tid >> 3, l = tid & 7;
+            if (f_t0 + t < T) gdn_pf_l2(h + (f_t0 + t) * C + (l < 4 ? HK * S : 0) + qhd * S + 32 * (l & 3));
+            if (ch + 2 < nch && tid < GCH) {
+                gdn_pf_l2(tm + (((int64_t) (ch + 2) * HV + vh) * GCH + tid) * GCH);
+                gdn_pf_l2(pm + (((int64_t) (ch + 2) * HV + vh) * GCH + tid) * GCH);
+            }
+        }
+        const uint16_t* bkh = kh + b * GCH * GTC_KP;
+        const uint16_t* bkl = kl + b * GCH * GTC_KP;
+        const uint16_t* bqh = qh + b * GCH * GTC_KP;
+        const uint16_t* bql = ql + b * GCH * GTC_KP;
+        const uint16_t* bph = ph + b * GCH * GTC_PP;
+        const uint16_t* bpl = pl + b * GCH * GTC_PP;
+        const float* bsv = sv + b * GCH * GTC_VP;
+        const float* bst = st + b * GCH * GTC_TP;
+        const float4* bsc = sc + b * GCH;
+        // (a) X^T = S0^T K^T and QS^T = S0^T Q^T, the state x 2^es (its largest entry in [2^14, 2^15))
+        float m = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) m = fmaxf(m, fabsf(s[j][q]));
+        const int es = gtc_scale_exp(gtc_warp_max(m));
+        float xt[4][4] = {}, qs[4][4] = {};
+        gtc_prod_state(s, gtc_pow2(es), bkh, bkl, bqh, bql, xt, qs);
+        // (b) Y^T = beta_i (V^T - e'_i X^T), e'_i = exp(gamma_i) 2^-(8 + es): lane (gid, tig) holds tokens
+        // 8nt + 2tig and + 1, columns c0 + gid and + 8
+        const float eS = gtc_pow2(-(8 + es));
+        float yt[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const float4 s0 = gtc_lds128(bsc + 8 * nt + 2 * tig), s1 = gtc_lds128(bsc + 8 * nt + 2 * tig + 1);
+            const float* v = bsv + (8 * nt + 2 * tig) * GTC_VP + c0 + gid;
+            const float e0 = s0.y * eS, e1 = s1.y * eS;
+            yt[nt][0] = s0.x * fmaf(-e0, xt[nt][0], v[0]);
+            yt[nt][1] = s1.x * fmaf(-e1, xt[nt][1], v[GTC_VP]);
+            yt[nt][2] = s0.x * fmaf(-e0, xt[nt][2], v[8]);
+            yt[nt][3] = s1.x * fmaf(-e1, xt[nt][3], v[GTC_VP + 8]);
+        }
+        // (c) D^T = Y^T T^T on tf32x3 (T above its diagonal skipped)
+        float dt[4][4] = {};
+        gtc_prod_yt<true>(yt, bst, dt);
+        // (d) o^T = e_t QS^T + D^T P^T: the accumulator starts as 2^(ed + 8) e_t QS^T (QS^T came out x 2^(8 + es)),
+        // D^T goes in x 2^ed, P x 2^8; the output is the accumulator x 2^-(ed + 8), then rsqrt(S) as gdn_chunk_scan_kernel
+        float md = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) md = fmaxf(md, fabsf(dt[nt][q]));
+        const int ed = gtc_scale_exp(gtc_warp_max(md));
+        const float sD = gtc_pow2(ed), sO = gtc_pow2(ed + 8), sOi = gtc_pow2(-(ed + 8)), eO = gtc_pow2(ed - es);
+        float ot[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const float e0 = gtc_lds128(bsc + 8 * nt + 2 * tig).y * eO, e1 = gtc_lds128(bsc + 8 * nt + 2 * tig + 1).y * eO;
+            ot[nt][0] = qs[nt][0] * e0; ot[nt][1] = qs[nt][1] * e1; ot[nt][2] = qs[nt][2] * e0; ot[nt][3] = qs[nt][3] * e1;
+        }
+        gtc_prod_dt<true>(dt, sD, bph, bpl, ot);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int t = 8 * nt + 2 * tig + (q & 1);
+                if (t < n) oc_out[(c_t0 + t) * rs + (size_t) vh * S + c0 + gid + 8 * (q >> 1)] = (ot[nt][q] * sOi) * out_scale;
+            }
+        // (e) S^T = eL S0^T + Dd^T K, Dd^T = f_i D^T: the accumulator x (eL 2^(ed + 8)) before (one rounding, as the
+        // s *= gL of gdn_chunk_scan_kernel), Dd^T in x 2^ed, K x 2^8, the accumulator x 2^-(ed + 8) after
+        const float sPre = seL[b] * sO;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) s[j][q] *= sPre;
+        float dd[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const float f0 = gtc_lds128(bsc + 8 * nt + 2 * tig).z * sD, f1 = gtc_lds128(bsc + 8 * nt + 2 * tig + 1).z * sD;
+            dd[nt][0] = dt[nt][0] * f0; dd[nt][1] = dt[nt][1] * f1; dd[nt][2] = dt[nt][2] * f0; dd[nt][3] = dt[nt][3] * f1;
+        }
+        gtc_update_state(s, dd, bkh, bkl);
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) s[j][q] *= sOi;
+        if (more) {   // the next chunk's k, q, T, P and scalars into the other buffer
+            float4 kq[KQ4], t4, p4;
+            float bet = 0.0f, gam = 0.0f, gL = 0.0f;
+            load_kq(n_t0, nn, kq);
+            load_tp(ch + 1, t4, p4);
+            load_sc(ch + 1, n_t0, nn, bet, gam, gL);
+            store_kq(b ^ 1, kq);
+            store_tp(b ^ 1, t4, p4);
+            store_sc(b ^ 1, bet, gam, gL);
+        }
+        gdn_cp_wait_all();   // this thread's v copies for the next chunk; the barrier at the top publishes them
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        float* p = state + (size_t) (8 * j + 2 * tig) * rs + (size_t) vh * S + c0 + gid;
+        p[0] = s[j][0]; p[rs] = s[j][1]; p[8] = s[j][2]; p[rs + 8] = s[j][3];
     }
 }
 #endif   // !__HIPCC__

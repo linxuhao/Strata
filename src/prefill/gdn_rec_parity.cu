@@ -8,10 +8,13 @@
 // output, the state after it and the FP16 output must be the same bits.  STRATA_GDN_CHUNKED=1's recurrence in chunks
 // (copied below too) sums in another order: it must stay within 1e-4 of gdn_rec_kh_kernel (largest |difference| over
 // largest |value|, the output and the state), also at T = 8192 and 32768; up to 8192 both are also measured against
-// the recurrence in FP64.
+// the recurrence in FP64.  STRATA_GDN_TC=1's tensor-core scan (gdn_tc.cuh, included below) is held to the same 1e-4,
+// also on stress inputs (the state 100x smaller, 50x larger or zero, v 50x larger, slow gates, coherent keys).
 //
 // Synthetic inputs of the model's shape (q/k L2-normalized per key head as gdn_l2_kernel leaves them), no model.
 //   gdn_rec_parity            the bit checks (T from 1 to 4099, a non-zero state as after an earlier chunk)
+//   gdn_rec_parity --long     and the tensor-core scan at T = 51820 (needs ~7 GB)
+//   gdn_rec_parity --selftest-frag   the tensor-core scan's fragment helpers alone, one warp each, against FP64
 //   gdn_rec_parity --bench    and the timings at T = 2048, 8192 and 32768 (one layer, all 48 value heads); the two
 //                             variants' launches alternate, since a card under load steps its clock down after a
 //                             fraction of a second (see native_grouped_parity); then both at 1 to 6 blocks per
@@ -592,6 +595,43 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
 }
 // src/prefill/kernels.cu's tensor-core scan (STRATA_GDN_TC=1): the same text, included there too
 #include "gdn_tc.cuh"
+// src/prefill/kernels.cu's gdn_rec_tc, copied as it is there (with the raw device attributes, as gdn_rec_chunked above)
+cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                       cudaStream_t s) {
+    if (T <= 0) return cudaSuccess;
+    {
+        int dev = 0, major = 0, sms = 0, smem = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return cudaErrorNotSupported;
+        }
+        if (major < 8 || sms < HV || (size_t) smem < kTcScanSmem<false>) return cudaErrorNotSupported;
+    }
+    float* scratch = gdn_chunk_scratch();
+    if (scratch == nullptr) return cudaErrorMemoryAllocation;
+    const int nb = (int) ((std::min<int64_t>(GSB, T) + GCH - 1) / GCH);
+    const size_t tsz = (size_t) nb * HV * GCH * GCH;
+    float *tm = scratch, *pm = tm + tsz, *gm = pm + tsz;
+    {   // once a device
+        static bool attrs[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev >= 0 && dev < 64 && !attrs[dev]) {
+            cudaFuncSetAttribute(gdn_chunk_prep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kChunkPrepSmem);
+            cudaFuncSetAttribute(gdn_tc_scan_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
+            attrs[dev] = true;
+        }
+    }
+    for (int64_t t0 = 0; t0 < T; t0 += GSB) {
+        const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
+        gdn_chunk_prep_kernel<<<dim3((unsigned) nch, HK), 256, kChunkPrepSmem, s>>>(h, gate, beta, tm, pm, gm, t0, T);
+        gdn_tc_scan_kernel<false><<<HV, GTC_CW * 32, kTcScanSmem<false>, s>>>(state, h, beta, tm, pm, gm, y, t0, nch, T);
+    }
+    return cudaSuccess;
+}
 // the output norm over a head's 128 columns, into the FP16 copy the out projection reads (the FP32 output before the
 // norm stays in its scratch buffer)
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
@@ -652,13 +692,23 @@ __global__ void l2_rows(float* h, float eps) {
     __syncthreads();
     x[threadIdx.x] = v * rsqrtf(part[0] + part[1] + part[2] + part[3] + eps);
 }
-// gate = log of the decay (mostly near 1, some strong), beta in (0, 1)
-__global__ void fill_gates(float* gate, float* beta, int64_t n, uint64_t seed) {
+// gate = log of the decay (mostly near 1, some strong; slow: -0.001 u, so the state grows for long), beta in (0, 1)
+__global__ void fill_gates(float* gate, float* beta, int64_t n, uint64_t seed, bool slow = false) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
         const float u = uni(seed * 0x9E3779B97F4A7C15ULL + 7 * (uint64_t) i);
-        gate[i] = -0.02f - 0.8f * u * u * u;
+        gate[i] = slow ? -0.001f * u : -0.02f - 0.8f * u * u * u;
         beta[i] = 1.0f / (1.0f + expf(-gauss(seed * 0xD1B54A32D192ED03ULL + (uint64_t) i)));
     }
+}
+// coherent keys: every token's k row = a key head's k_0 + 0.05 x the row that was there (before l2_rows): the
+// chunk's T = (I + A)^-1 then carries large entries, the tf32 product's reason
+__global__ void coherent_k(float* h, uint64_t seed) {
+    float* x = h + (int64_t) blockIdx.y * C + HK * S + (int64_t) blockIdx.x * S;
+    x[threadIdx.x] = gauss(seed * 0x9E3779B97F4A7C15ULL + (uint64_t) (blockIdx.x * S + threadIdx.x)) + 0.05f * x[threadIdx.x];
+}
+__global__ void scale_v(float* h, int64_t T, float scale) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < T * HV * S; i += (int64_t) gridDim.x * blockDim.x)
+        h[(i / (HV * S)) * C + 2 * HK * S + i % (HV * S)] *= scale;
 }
 __global__ void count_diff(const uint32_t* a, const uint32_t* b, int64_t n, unsigned long long* out) {
     unsigned long long d = 0;
@@ -740,10 +790,15 @@ unsigned long long diff_words(const void* a, const void* b, size_t bytes) {
     return h;
 }
 
+// The model's shapes with gaussian values; the defaults are the bit checks' inputs (the state as after an earlier
+// chunk, scale 0.05).  The others stress the tensor-core scan's f16 range handling: the state 100x smaller, 50x larger
+// or zero (a fresh conversation), v 50x larger, slow gates, coherent keys.
 struct Inputs {
     int64_t T = 0;
     float *h = nullptr, *gate = nullptr, *beta = nullptr, *z = nullptr, *gamma = nullptr, *state0 = nullptr;
-    explicit Inputs(int64_t t, uint64_t seed) : T(t) {
+    explicit Inputs(int64_t t, uint64_t seed, float state_scale = 0.05f, float v_scale = 1.0f, bool slow_gates = false,
+                    bool coherent_keys = false)
+        : T(t) {
         h = dalloc<float>((size_t) T * C);
         gate = dalloc<float>((size_t) T * HV);
         beta = dalloc<float>((size_t) T * HV);
@@ -751,11 +806,13 @@ struct Inputs {
         gamma = dalloc<float>(S);
         state0 = dalloc<float>((size_t) S * HV * S);
         fill_gauss<<<4096, 256>>>(h, T * C, 1.0f, seed);
+        if (coherent_keys) coherent_k<<<dim3(HK, (unsigned) T), S>>>(h, seed + 5);
         l2_rows<<<dim3(2 * HK, (unsigned) T), S>>>(h, 1e-6f);
-        fill_gates<<<1024, 256>>>(gate, beta, T * HV, seed + 1);
+        if (v_scale != 1.0f) scale_v<<<4096, 256>>>(h, T, v_scale);
+        fill_gates<<<1024, 256>>>(gate, beta, T * HV, seed + 1, slow_gates);
         fill_gauss<<<4096, 256>>>(z, T * HV * S, 1.0f, seed + 2);
         fill_gauss<<<1, 128>>>(gamma, S, 0.1f, seed + 3, 1.0f);
-        fill_gauss<<<1024, 256>>>(state0, (int64_t) S * HV * S, 0.05f, seed + 4);
+        fill_gauss<<<1024, 256>>>(state0, (int64_t) S * HV * S, state_scale, seed + 4);
         ck(cudaDeviceSynchronize(), "inputs");
     }
     Inputs(const Inputs&) = delete;
@@ -860,8 +917,10 @@ double max_rel_f64(const float* a, const double* ref, size_t n) {   // max |a - 
     }
     return mv > 0.0 ? md / mv : md;
 }
-int check_chunked(int64_t T, uint64_t seed) {
-    Inputs in(T, seed);
+// a recurrence of gdn_rec_chunked's shape (the FP32 chunked pair, the tensor-core scan) on the inputs given
+using RecLaunch = cudaError_t (*)(float*, const float*, const float*, const float*, float*, int64_t, cudaStream_t);
+int check_variant(const Inputs& in, const char* label, RecLaunch launch, const char* needs) {
+    const int64_t T = in.T;
     const size_t st = (size_t) S * HV * S, oc_n = (size_t) T * HV * S;
     float* s0 = dalloc<float>(st);
     float* s1 = dalloc<float>(st);
@@ -870,30 +929,55 @@ int check_chunked(int64_t T, uint64_t seed) {
     ck(cudaMemcpy(s0, in.state0, st * 4, cudaMemcpyDeviceToDevice), "state copy");
     ck(cudaMemcpy(s1, in.state0, st * 4, cudaMemcpyDeviceToDevice), "state copy");
     gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG)>>>(s0, in.h, in.gate, in.beta, o0, in.T);
-    const cudaError_t e = gdn_rec_chunked(s1, in.h, in.gate, in.beta, o1, in.T, 0);
+    const cudaError_t e = launch(s1, in.h, in.gate, in.beta, o1, in.T, 0);
     if (e == cudaErrorNotSupported) {
-        std::printf("     T=%-6lld chunked: not on this card (sm_80+, 128 SMs, 93.7 KB a block)\n", (long long) T);
+        std::printf("     T=%-6lld %s: not on this card (%s)\n", (long long) T, label, needs);
         cudaFree(s0); cudaFree(s1); cudaFree(o0); cudaFree(o1);
         return 0;
     }
-    ck(e, "chunked");
-    ck(cudaDeviceSynchronize(), "chunked run");
+    ck(e, label);
+    ck(cudaDeviceSynchronize(), label);
     const double eo = max_rel(o0, o1, oc_n), es = max_rel(s0, s1, st);
     const bool bad = !(eo < 1e-4) || !(es < 1e-4);
-    std::printf("%s T=%-6lld chunked (STRATA_GDN_CHUNKED): output %.2e, state %.2e (max |diff| / max |value|)\n",
-                bad ? "FAIL" : "    ", (long long) T, eo, es);
+    std::printf("%s T=%-6lld %s: output %.2e, state %.2e (max |diff| / max |value|)\n", bad ? "FAIL" : "    ",
+                (long long) T, label, eo, es);
     if (T <= 8192) {   // both against FP64 (its output: 8 bytes a value, so not at 32K)
         double* sd = dalloc<double>(st);
         double* od = dalloc<double>(oc_n);
         to_f64<<<1024, 256>>>(in.state0, sd, (int64_t) st);
         gdn_rec_f64_kernel<<<HV, S>>>(sd, in.h, in.gate, in.beta, od, in.T);
         ck(cudaDeviceSynchronize(), "FP64 run");
-        std::printf("            against FP64: gdn_rec_kh_kernel output %.2e, state %.2e; chunked output %.2e, state %.2e\n",
+        std::printf("            against FP64: gdn_rec_kh_kernel output %.2e, state %.2e; this one output %.2e, state %.2e\n",
                     max_rel_f64(o0, od, oc_n), max_rel_f64(s0, sd, st), max_rel_f64(o1, od, oc_n), max_rel_f64(s1, sd, st));
         cudaFree(sd); cudaFree(od);
     }
     cudaFree(s0); cudaFree(s1); cudaFree(o0); cudaFree(o1);
     return bad ? 1 : 0;
+}
+int check_chunked(int64_t T, uint64_t seed) {
+    Inputs in(T, seed);
+    return check_variant(in, "chunked (STRATA_GDN_CHUNKED)", gdn_rec_chunked, "sm_80+, 128 SMs, 93.7 KB a block");
+}
+constexpr const char* kTcNeeds = "sm_80+, 48 SMs, 121 KB a block";
+int check_tc(int64_t T, uint64_t seed) {
+    Inputs in(T, seed);
+    return check_variant(in, "tc (STRATA_GDN_TC=1)", gdn_rec_tc, kTcNeeds);
+}
+// the tensor-core scan on the stress inputs (Inputs): its f16 range handling has a case for each
+int check_tc_stress(int64_t T, uint64_t seed) {
+    struct Case { const char* label; float state_scale, v_scale; bool slow_gates, coherent_keys; };
+    const Case cases[] = {{"tc (STRATA_GDN_TC=1), state0 x 0.01", 5e-4f, 1.0f, false, false},
+                          {"tc (STRATA_GDN_TC=1), state0 x 50", 2.5f, 1.0f, false, false},
+                          {"tc (STRATA_GDN_TC=1), state0 = 0", 0.0f, 1.0f, false, false},
+                          {"tc (STRATA_GDN_TC=1), v x 50", 0.05f, 50.0f, false, false},
+                          {"tc (STRATA_GDN_TC=1), slow gates", 0.05f, 1.0f, true, false},
+                          {"tc (STRATA_GDN_TC=1), coherent keys", 0.05f, 1.0f, false, true}};
+    int fails = 0;
+    for (const Case& c : cases) {
+        Inputs in(T, seed++, c.state_scale, c.v_scale, c.slow_gates, c.coherent_keys);
+        fails += check_variant(in, c.label, gdn_rec_tc, kTcNeeds);
+    }
+    return fails;
 }
 
 // ------------------------------------------------------------------ the tensor-core scan's fragment self-test (--selftest-frag)
@@ -1219,6 +1303,18 @@ void bench(int64_t T) {
             });
             if (i >= warm) t_kc[v].push_back(ms);
         }
+    std::vector<float> t_tc[2];   // gdn_rec_kh_kernel and the tensor-core scan, alternating
+    const bool can_tc = gdn_rec_tc(state, in.h, in.gate, in.beta, oc, in.T, 0) == cudaSuccess &&
+                        cudaDeviceSynchronize() == cudaSuccess;
+    for (int i = 0; can_tc && i < warm + rounds; ++i)
+        for (int j = 0; j < 2; ++j) {
+            const int v = (i + j) % 2;
+            const float ms = timed([&] {
+                if (v == 0) gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG)>>>(state, in.h, in.gate, in.beta, oc, in.T);
+                else ck(gdn_rec_tc(state, in.h, in.gate, in.beta, oc, in.T, 0), "tc");
+            });
+            if (i >= warm) t_tc[v].push_back(ms);
+        }
     const float r0 = median(t_rec[kBefore]), r1 = median(t_rec[kKeyHead]), n0 = median(t_norm[0]), n1 = median(t_norm[1]);
     std::printf("  T = %lld tokens, one layer (48 value heads), medians of %d alternating runs:\n", (long long) T, rounds);
     std::printf("    recurrence, before (gdn_rec_cols_pipe_kernel)  %8.2f ms  (%.3f us per token)\n", r0,
@@ -1229,6 +1325,11 @@ void bench(int64_t T) {
         const float kh = median(t_kc[0]), kc = median(t_kc[1]);
         std::printf("    recurrence, chunked (STRATA_GDN_CHUNKED=1)     %8.2f ms  (%.3f us per token)  %.2fx gdn_rec_kh_kernel\n",
                     kc, 1000.0f * kc / (float) T, kh / kc);
+    }
+    if (can_tc) {
+        const float kh = median(t_tc[0]), tc = median(t_tc[1]);
+        std::printf("    recurrence, tensor-core chunked (STRATA_GDN_TC=1) %8.2f ms  (%.3f us per token)  %.2fx gdn_rec_kh_kernel\n",
+                    tc, 1000.0f * tc / (float) T, kh / tc);
     }
     std::printf("    output norm, before (FP32 and FP16 store)      %8.2f ms\n", n0);
     std::printf("    output norm, FP16 store only                   %8.2f ms  %.2fx\n", n1, n0 / n1);
@@ -1627,10 +1728,11 @@ void fewer_sms(int64_t T) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool do_bench = false, do_self = false;
+    bool do_bench = false, do_self = false, do_long = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
         if (std::strcmp(argv[i], "--selftest-frag") == 0) do_self = true;
+        if (std::strcmp(argv[i], "--long") == 0) do_long = true;
     }
     cudaDeviceProp p{};
     ck(cudaGetDeviceProperties(&p, 0), "device");
@@ -1646,6 +1748,10 @@ int main(int argc, char** argv) {
     for (const int64_t T : Ts) fails += check_bits(T, seed++);
     for (const int64_t T : Ts) fails += check_chunked(T, seed++);
     for (const int64_t T : {(int64_t) 8192, (int64_t) 32768}) fails += check_chunked(T, seed++);
+    for (const int64_t T : Ts) fails += check_tc(T, seed++);
+    for (const int64_t T : {(int64_t) 8192, (int64_t) 32768}) fails += check_tc(T, seed++);
+    for (const int64_t T : {(int64_t) 4099, (int64_t) 32768}) { fails += check_tc_stress(T, seed); seed += 8; }
+    if (do_long) fails += check_tc(51820, seed++);   // the engine's longest prompt (about 7 GB of inputs and outputs)
     if (do_bench) {
         std::printf("--bench: the prompt path's DeltaNet recurrence\n");
         bench(2048);

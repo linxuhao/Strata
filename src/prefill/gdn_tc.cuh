@@ -62,61 +62,24 @@ constexpr size_t kTcTiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2, kTcTeByt
                  kTcScBytes = (size_t) GTC_NB * HV * GCH * 16, kTcKqBytes = (size_t) GTC_NB * HK * 4 * GCH * S * 2,
                  kTcPiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2;
 static_assert(kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes == 60305408, "gdn_tc.cuh: the scratch plan");
-// two slots (gdn_rec_tc's overlap: the prep of a super-block writes one while the scan of the one before reads the
-// other), allocated on first use and kept, as gdn_chunk_scratch (kernels.cu); ti == nullptr when the card had no room
-constexpr size_t kTcScratchBytes = kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes;
-GtcScratch gdn_tc_scratch(int slot) {
+// allocated on first use and kept, as gdn_chunk_scratch (kernels.cu); ti == nullptr when the card had no room
+GtcScratch gdn_tc_scratch() {
     static unsigned char* bufs[64] = {};
     GtcScratch r = {nullptr, nullptr, nullptr, nullptr, nullptr};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return r; }
-    if (bufs[dev] == nullptr && cudaMalloc((void**) &bufs[dev], 2 * kTcScratchBytes) != cudaSuccess) {
+    if (bufs[dev] == nullptr && cudaMalloc((void**) &bufs[dev], kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes) != cudaSuccess) {
         cudaGetLastError();
         bufs[dev] = nullptr;
         return r;
     }
-    unsigned char* p = bufs[dev] + (slot & 1) * kTcScratchBytes;
+    unsigned char* p = bufs[dev];
     r.ti = reinterpret_cast<uint16_t*>(p);
     r.te = reinterpret_cast<float*>(p + kTcTiBytes);
     r.sc = reinterpret_cast<float4*>(p + kTcTiBytes + kTcTeBytes);
     r.kq = reinterpret_cast<uint16_t*>(p + kTcTiBytes + kTcTeBytes + kTcScBytes);
     r.pi = reinterpret_cast<uint16_t*>(p + kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes);
     return r;
-}
-// gdn_rec_tc's overlap of the prep with the scan of the super-block before it (the scan's 48 blocks leave 22 SMs of
-// the CMP 170HX idle; the prep's blocks fit nowhere else, the scan's take an SM's whole register file): two
-// non-blocking streams a device, the scan's at the highest priority and the prep's at the lowest - with equal
-// priorities the prep of the next super-block, already running with 1,024 blocks queued, kept every SM as its blocks
-// retired and the scan waited for its queue to drain (measured: 0.214 -> 0.212 us a token at 32768, one run of
-// twelve at 0.176) - and the events that order them: both wait for the caller's stream (in), the scan for its
-// prep (prep[slot]), the prep two super-blocks on for the scan that read its slot (scan[slot]), the caller's
-// stream for the last scan (out).  ok == false (a creation failed): no overlap, everything on the caller's stream.
-struct GtcOverlap {
-    cudaStream_t lo, hi;
-    cudaEvent_t in, prep[2], scan[2], out;
-    bool ok;
-};
-const GtcOverlap& gdn_tc_overlap() {
-    static GtcOverlap ov[64] = {};
-    static bool made[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); dev = 0; }
-    if (!made[dev]) {
-        made[dev] = true;
-        GtcOverlap& o = ov[dev];
-        int least = 0, greatest = 0;
-        o.ok = cudaDeviceGetStreamPriorityRange(&least, &greatest) == cudaSuccess &&
-               cudaStreamCreateWithPriority(&o.lo, cudaStreamNonBlocking, least) == cudaSuccess &&
-               cudaStreamCreateWithPriority(&o.hi, cudaStreamNonBlocking, greatest) == cudaSuccess &&
-               cudaEventCreateWithFlags(&o.in, cudaEventDisableTiming) == cudaSuccess &&
-               cudaEventCreateWithFlags(&o.prep[0], cudaEventDisableTiming) == cudaSuccess &&
-               cudaEventCreateWithFlags(&o.prep[1], cudaEventDisableTiming) == cudaSuccess &&
-               cudaEventCreateWithFlags(&o.scan[0], cudaEventDisableTiming) == cudaSuccess &&
-               cudaEventCreateWithFlags(&o.scan[1], cudaEventDisableTiming) == cudaSuccess &&
-               cudaEventCreateWithFlags(&o.out, cudaEventDisableTiming) == cudaSuccess;
-        if (!o.ok) cudaGetLastError();
-    }
-    return ov[dev];
 }
 
 // the warp's largest of non-negative floats: their bits order as unsigned integers, so one redux.sync (sm_80).  Under
